@@ -20,7 +20,7 @@ uv add pipecat-mirai     # or: pip install pipecat-mirai
 
 - A Mirai API key (`sk_live_…`) from the [Mirai console](https://sandbox.voice.miraiminds.co).
   Set it as `MIRAI_API_KEY`, or pass `api_key=`.
-- Pipecat 1.8.1 or newer and Python 3.10+.
+- Pipecat 1.8.1 or newer and Python 3.11+.
 
 ## Usage
 
@@ -106,7 +106,7 @@ actually stops hearing the bot.
 
 ## Compatibility
 
-Tested with Pipecat 1.8.1 and 1.12.0 on Python 3.10–3.12. `apply_output_lead` changes how
+Tested with Pipecat 1.8.1 and 1.12.0 on Python 3.11–3.12. `apply_output_lead` changes how
 Pipecat's websocket output transports time their writes. A test in this repo
 fails if a new Pipecat release changes that, and the function logs a warning and
 does nothing for transports it doesn't support.

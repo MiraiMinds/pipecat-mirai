@@ -254,7 +254,7 @@ async def phone_call(a, n, results):
         while time.monotonic() < end:
             try:
                 msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=1.0))
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
             except Exception:
                 break

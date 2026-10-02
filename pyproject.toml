@@ -10,7 +10,7 @@ readme = "README.md"
 license = "BSD-2-Clause"
 license-files = ["LICENSE"]
 authors = [{ name = "Sona Labs Pvt Ltd", email = "sneh.mehta@miraiminds.co" }]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 keywords = ["pipecat", "tts", "text-to-speech", "voice-agent", "hindi", "telephony", "mirai"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -48,7 +48,7 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 110
-target-version = "py310"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
