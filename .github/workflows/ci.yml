@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+        pipecat: ["1.8.1", "latest"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install
+        run: |
+          uv venv --python ${{ matrix.python }}
+          if [ "${{ matrix.pipecat }}" = "latest" ]; then PIPECAT="pipecat-ai[websocket]"; else PIPECAT="pipecat-ai[websocket]==${{ matrix.pipecat }}"; fi
+          uv pip install -e . "$PIPECAT" pytest pytest-asyncio ruff
+      - name: Lint
+        run: |
+          .venv/bin/ruff check .
+          .venv/bin/ruff format --check src tests examples benchmarks
+      - name: Test
+        run: .venv/bin/python -m pytest -q
+      - name: Examples compile
+        run: .venv/bin/python -m py_compile examples/foundational/01-say-hello.py examples/phone/twilio_bot.py benchmarks/phone-breaks/phone_breaks.py
