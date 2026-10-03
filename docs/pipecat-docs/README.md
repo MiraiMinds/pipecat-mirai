@@ -9,4 +9,5 @@ Files for the community-integration PR to [pipecat-ai/docs](https://github.com/p
 4. Attach a 30–60 s demo video showing a call and an interruption, then post in
    `#community-integrations` on the Pipecat Discord.
 
-Submit after the repository is public and `pipecat-mirai` is on PyPI.
+Submitted as https://github.com/pipecat-ai/docs/pull/1407 on 2026-10-03, with the demo video attached
+to the v0.1.0 release.

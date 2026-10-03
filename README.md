@@ -10,6 +10,9 @@ voice agents: natural Hindi, Hinglish and Gujarati voices, streamed with about
 - **`apply_output_lead()`**: stops audio breaking up on phone calls when your
   server is busy (see [Phone calls](#phone-calls)). This works with any TTS service.
 
+**Demo:** [a 68-second conversation in Hindi with an interruption](https://github.com/MiraiMinds/pipecat-mirai/releases/download/v0.1.0/pipecat-mirai-demo.mp4)
+(Pipecat 1.12, Sarvam STT, `MiraiTTSService`).
+
 ## Installation
 
 ```bash
