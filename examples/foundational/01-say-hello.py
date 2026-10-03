@@ -1,3 +1,7 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pipecat-mirai"]
+# ///
 #
 # Copyright (c) 2026, Sona Labs Pvt Ltd
 #
@@ -8,6 +12,10 @@
 
     export MIRAI_API_KEY=sk_live_...
     uv run examples/foundational/01-say-hello.py --voice shruti
+
+Runs without cloning the repo, too (uv installs pipecat-mirai for it):
+
+    uv run https://raw.githubusercontent.com/MiraiMinds/pipecat-mirai/main/examples/foundational/01-say-hello.py
 
 No room, microphone, LLM or STT is needed. The request is billed like any other
 synthesis.
@@ -24,6 +32,7 @@ from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.workers.runner import WorkerRunner
 
 from pipecat_mirai import MiraiTTSService
+from pipecat_mirai.tts import DEFAULT_BASE_URL
 
 
 class Capture(FrameProcessor):
@@ -41,7 +50,7 @@ class Capture(FrameProcessor):
 
 
 async def main(args):
-    tts = MiraiTTSService(settings=MiraiTTSService.Settings(voice=args.voice))
+    tts = MiraiTTSService(base_url=args.base_url, settings=MiraiTTSService.Settings(voice=args.voice))
     capture = Capture()
     worker = PipelineWorker(
         Pipeline([tts, capture]), params=PipelineParams(audio_out_sample_rate=args.sample_rate)
@@ -64,6 +73,7 @@ async def main(args):
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--voice", default="neha", help="ashu, neha, shruti or sameer")
+    p.add_argument("--base-url", default=DEFAULT_BASE_URL, help="Mirai API base URL, including /v1")
     p.add_argument("--text", default="नमस्ते, मैं आपकी कैसे मदद कर सकती हूँ?")
     p.add_argument("--sample-rate", type=int, default=24000)
     p.add_argument("--output", default="hello.wav")
