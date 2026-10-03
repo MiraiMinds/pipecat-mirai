@@ -59,6 +59,7 @@ async def speak(service, rate, text="नमस्ते, मैं आपकी 
         service,
         frames_to_send=[TTSSpeakFrame(text)],
         pipeline_params=PipelineParams(audio_out_sample_rate=rate),
+        start_timeout=10.0,  # the first pipeline on a cold CI runner can take >1 s to start
     )
     return down, up
 
