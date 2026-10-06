@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - 2026-10-06
+
+### Added
+
+- `MiraiRealtimeLLMService`: Mirai's Realtime API in Pipecat. It's Pipecat's
+  `OpenAIRealtimeLLMService`, set up for Mirai: session URL parameters (`agent_id`,
+  `variables`, `metadata`, `webhook_url`, `max_duration_secs`), the `mirai`
+  settings block, Mirai's own events handled (stock Pipecat stops reading on
+  them), per-turn timing through `on_turn_metrics`, and caller audio resampled
+  to 24 kHz from any pipeline rate.
+- `MiraiTurnMetrics`, `SANDBOX_REALTIME_URL` and `PRODUCTION_REALTIME_URL`.
+- Examples: a microphone conversation on the Realtime API, and a Twilio phone
+  bot on the Realtime API.
+
 ## [0.1.0] - 2026-10-02
 
 ### Added
