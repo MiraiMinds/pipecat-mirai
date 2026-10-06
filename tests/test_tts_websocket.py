@@ -65,6 +65,20 @@ async def run(tts, rate, frames, *, metrics=False):
     return rec, down, up
 
 
+def spy_appends(tts):
+    """Record when the service hands each audio frame to Pipecat."""
+    appended = []
+    append = tts.append_to_audio_context
+
+    async def spy(context_id, frame):
+        if isinstance(frame, TTSAudioRawFrame):
+            appended.append((time.monotonic(), frame))
+        await append(context_id, frame)
+
+    tts.append_to_audio_context = spy
+    return appended
+
+
 def ws_tts(url, **kwargs):
     return MiraiWebsocketTTSService(api_key="sk_test", url=url, **kwargs)
 
@@ -270,12 +284,16 @@ async def test_prebuffer_waits_out_a_short_first_chunk(first_ms):
     # is pushed until 150 ms is in hand.
     fake = FakeMiraiWS(seconds=1.0, reads=(first_ms * 16, 1600), first_gap=0.2)
     async with fake.serve() as url:
-        rec, _, _ = await run(ws_tts(url), 8000, [TTSSpeakFrame(TEXT)], metrics=True)
+        tts = ws_tts(url)
+        appended = spy_appends(tts)
+        rec, _, _ = await run(tts, 8000, [TTSSpeakFrame(TEXT)], metrics=True)
     first_binary = fake.conns[0].binary[0][0]
     audio = rec.audio
     assert audio[0][0] - first_binary >= 0.19
-    first_push = [f for t, f in audio if t - audio[0][0] < 0.005]
-    assert sum(len(f.audio) for f in first_push) >= 0.15 * 8000 * 2
+    # Judged where the service hands frames to Pipecat: one push is appended
+    # back to back, while Pipecat's queues can spread it out downstream.
+    push = [f for t, f in appended if t - appended[0][0] < 0.005]
+    assert sum(len(f.audio) for f in push) >= 0.15 * 8000 * 2
     assert b"".join(f.audio for _, f in audio) == tone(1.0, 8000)
     ttfb = ttfb_of(rec)
     assert ttfb and ttfb[0] < 0.15  # TTFB is the first byte received, not the first push
