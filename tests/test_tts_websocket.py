@@ -143,7 +143,7 @@ async def test_server_that_sends_another_rate_is_resampled():
     assert not errors_in(up)
 
 
-@pytest.mark.parametrize("rate, option", [(22050, "auto"), (8000, None)])
+@pytest.mark.parametrize("rate, option", [(32000, "auto"), (8000, None)])
 async def test_rate_left_out_means_48k_resampled(rate, option):
     fake = FakeMiraiWS(seconds=1.0)
     async with fake.serve() as url:
@@ -167,7 +167,7 @@ async def test_explicit_server_sample_rate():
 @pytest.mark.parametrize(
     "bad",
     [
-        {"server_sample_rate": 22050},
+        {"server_sample_rate": 32000},
         {"server_sample_rate": True},
         {"prebuffer_secs": -1},
         {"keepalive_secs": 0},
