@@ -46,7 +46,7 @@ DEFAULT_BASE_URL = "https://sandbox.voice.miraiminds.co/v1"
 # when a response carries no X-Sample-Rate header.
 SOURCE_SAMPLE_RATE = 48000
 # PCM rates the server can produce on request (the ``sample_rate`` request field).
-SERVER_SAMPLE_RATES = (8000, 16000, 24000, 48000)
+SERVER_SAMPLE_RATES = (8000, 16000, 22050, 24000, 44100, 48000)
 VOICES = ("ashu", "neha", "shruti", "sameer")
 # Audio is pushed downstream in frames of this length, whatever size the network
 # reads are. 40 ms is what Pipecat's output transports send per write by default.
@@ -121,7 +121,7 @@ class MiraiTTSService(TTSService):
                 ``audio_out_sample_rate``.
             server_sample_rate: The PCM rate to ask Mirai for. ``"auto"`` (the
                 default) asks for the output rate when Mirai serves it (8000,
-                16000, 24000 or 48000 Hz) and leaves the field out otherwise.
+                16000, 22050, 24000, 44100 or 48000 Hz) and leaves the field out otherwise.
                 An ``int`` from that list asks for that rate. ``None`` leaves
                 the field out, so Mirai sends 48 kHz as it did before 0.3.
                 Audio is resampled locally whenever the rate Mirai reports

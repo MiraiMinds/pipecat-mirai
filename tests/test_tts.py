@@ -251,7 +251,7 @@ def tts_for(fake, **kwargs):
 # --- server-side sample rate -------------------------------------------------------------
 
 
-@pytest.mark.parametrize("rate", [8000, 16000, 24000, 48000])
+@pytest.mark.parametrize("rate", [8000, 16000, 22050, 24000, 44100, 48000])
 async def test_asks_for_the_pipeline_rate_and_passes_audio_through(rate):
     fake = FakeMirai()
     tts = tts_for(fake)
@@ -305,9 +305,9 @@ async def test_missing_rate_header_means_48k():
 
 async def test_rate_mirai_does_not_serve_leaves_the_field_out():
     fake = FakeMirai(seconds=1.0)
-    down, _ = await speak(tts_for(fake), 22050)
+    down, _ = await speak(tts_for(fake), 32000)
     assert "sample_rate" not in fake.speech[0]
-    assert abs(len(audio_of(down, 22050)) // 2 - 22050) <= 1
+    assert abs(len(audio_of(down, 32000)) // 2 - 32000) <= 1
 
 
 async def test_server_sample_rate_none_sends_the_0_2_request():
@@ -328,7 +328,7 @@ async def test_explicit_server_sample_rate_is_resampled_to_the_output_rate():
     assert len(audio_of(down, 8000)) // 2 == 8000
 
 
-@pytest.mark.parametrize("bad", [22050, 44100, "fast", True, 8000.0])
+@pytest.mark.parametrize("bad", [11025, 32000, "fast", True, 8000.0])
 def test_invalid_server_sample_rate_is_refused(bad):
     with pytest.raises(ValueError, match="server_sample_rate"):
         MiraiTTSService(api_key="k", server_sample_rate=bad)

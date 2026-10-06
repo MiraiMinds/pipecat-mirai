@@ -74,7 +74,7 @@ Pipecat tracing. Interrupting the bot closes the HTTP stream at once.
 ### Sample rate
 
 The service asks Mirai for audio at your pipeline's output rate when Mirai serves
-it (8000, 16000, 24000 or 48000 Hz), so nothing is converted on your side. On a
+it (8000, 16000, 22050, 24000, 44100 or 48000 Hz), so nothing is converted on your side. On a
 phone pipeline at 8 kHz that is 128 kbit/s per call instead of 768 kbit/s at
 48 kHz. Bandwidth matters here: at 48 kHz, six concurrent calls on an ordinary
 link already receive audio slower than real time, and callers hear gaps.

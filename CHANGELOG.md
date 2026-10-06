@@ -8,10 +8,10 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
-- `MiraiTTSService` asks Mirai for audio at the pipeline's output rate (8, 16, 24
-  or 48 kHz) with the request's `sample_rate` field. An 8 kHz phone pipeline now
+- `MiraiTTSService` asks Mirai for audio at the pipeline's output rate (8, 16,
+  22.05, 24, 44.1 or 48 kHz) with the request's `sample_rate` field. An 8 kHz phone pipeline now
   downloads 128 kbit/s per call instead of 768 kbit/s.
-- `server_sample_rate` (`"auto"`, one of 8000/16000/24000/48000, or `None` for the
+- `server_sample_rate` (`"auto"`, one of 8000/16000/22050/24000/44100/48000, or `None` for the
   0.2 behaviour) chooses the rate to ask for.
 - `warm_connection` (on by default): the connection to Mirai opens with a
   `GET /v1/models` when the pipeline starts, and reopens right after an
