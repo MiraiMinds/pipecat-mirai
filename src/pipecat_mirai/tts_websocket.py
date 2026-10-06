@@ -351,6 +351,18 @@ class MiraiWebsocketTTSService(WebsocketTTSService):
         except Exception as exc:
             await self._report_connect_failure(exc)
         if self._websocket is not None:
+            task = self._receive_task
+            if (
+                task is not None
+                and task is not asyncio.current_task()
+                and not task.done()
+                and self._reconnect_in_progress
+                and self._is_open()
+            ):
+                # The receive task is sleeping out a reconnect backoff, but the
+                # socket is up again: read it now, not in a few seconds.
+                await self.cancel_task(task)
+                self._receive_task = None
             if self._receive_task is None or self._receive_task.done():
                 self._receive_task = self.create_task(
                     self._receive_task_handler(self._report_error), name="receive"

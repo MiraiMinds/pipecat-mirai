@@ -18,8 +18,11 @@ the sentence before it), ``honours_rate`` (False: always 48 kHz),
 ``fail`` (sentence -> error code, no retry_after), ``billing`` (sentence ->
 chars_billed), ``cancel_delay`` (how long the playing sentence keeps streaming
 after a cancel arrives), ``drop_after_bytes`` (abort the first connection's TCP
-after sending that much audio) and ``close_after`` (send session.closed and
-close the first connection that many seconds after it opens).
+after sending that much audio), ``base64`` (send audio.chunk events instead of
+binary frames) and ``close_after`` (send session.closed and
+close the first connection that many seconds after it opens), ``refuse_status``
+(answer every handshake with that HTTP status) and ``refuse_attempts``
+(handshake attempts, counted from 1, answered 503).
 """
 
 from __future__ import annotations
@@ -91,6 +94,8 @@ class FakeMiraiWS:
         drop_after_bytes=None,
         close_after=None,
         refuse_status=None,
+        refuse_attempts=(),
+        base64=False,
     ):
         self.seconds = seconds
         self.reads = reads
@@ -106,6 +111,9 @@ class FakeMiraiWS:
         self.drop_after_bytes = drop_after_bytes
         self.close_after = close_after
         self.refuse_status = refuse_status
+        self.refuse_attempts = set(refuse_attempts)  # handshake attempts (1-based) answered 503
+        self.attempts = 0
+        self.base64 = base64
         self.conns: list[_Conn] = []
         self.spoken: list[tuple[int, str, str]] = []  # (conn, context, sentence) fully sent
         self._requests = 0
@@ -133,9 +141,13 @@ class FakeMiraiWS:
     @asynccontextmanager
     async def serve(self):
         async def process_request(connection, request):
+            self.attempts += 1
             if self.refuse_status:
                 body = json.dumps({"error": {"code": "unauthorized", "message": "invalid API key"}})
                 return Response(self.refuse_status, "Refused", _headers(len(body)), body.encode())
+            if self.attempts in self.refuse_attempts:
+                body = json.dumps({"error": {"code": "unavailable", "message": "restarting"}})
+                return Response(503, "Unavailable", _headers(len(body)), body.encode())
             return None
 
         async with serve(self._handler, "127.0.0.1", 0, process_request=process_request) as server:
@@ -326,7 +338,11 @@ class FakeMiraiWS:
             n = self.reads[i % len(self.reads)]
             piece = audio[pos : pos + n]
             conn.binary.append((time.monotonic(), len(piece)))
-            await conn.ws.send(piece)
+            if self.base64:
+                chunk = {"type": "audio.chunk", "context_id": ctx.id, "request_id": rid, "data": b64(piece)}
+                await conn.ws.send(json.dumps(chunk))
+            else:
+                await conn.ws.send(piece)
             conn.audio_bytes += len(piece)
             pos += n
             i += 1

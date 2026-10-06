@@ -434,19 +434,47 @@ async def test_refused_handshake_is_reported():
 # --- connection: reconnect, keepalive, settings --------------------------------------------
 
 
-async def test_a_dropped_socket_is_reopened_and_the_reply_resent():
-    # The connection drops 0.25 s into the first sentence (audio already heard).
-    fake = FakeMiraiWS(seconds={s: 1.0 for s in SENTENCES}, reads=(1600,), pace=0.02, drop_after_bytes=4000)
+@pytest.mark.parametrize("heard", [True, False])
+async def test_a_dropped_socket_is_reopened_and_the_reply_resent(heard):
+    # The connection drops in the first sentence: after 0.3 s of its audio
+    # (past the 150 ms first-audio buffer, so the caller has started hearing
+    # it), or after 0.1 s (nothing pushed yet).
+    fake = FakeMiraiWS(
+        seconds={s: 1.0 for s in SENTENCES}, reads=(800,), pace=0.02, drop_after_bytes=4800 if heard else 1600
+    )
     async with fake.serve() as url:
         rec, down, up = await run(ws_tts(url), 8000, [*llm_turn(*TOKENS), SleepFrame(2.0)])
     assert len(fake.conns) == 2
-    first, second = fake.conns
+    second = fake.conns[1]
     assert second.received[0]["type"] == "session.update" and second.received[0]["sample_rate"] == 8000
-    # The sentence the caller had started hearing is not repeated; the rest is.
+    # A sentence the caller had started hearing is not repeated; the rest is.
+    rest = SENTENCES[1:] if heard else SENTENCES
     resent = [m for m in second.received if m["type"] == "text"]
-    assert " ".join(m["text"] for m in resent).split() == " ".join(SENTENCES[1:]).split()
-    assert [s for c, _, s in fake.spoken] == SENTENCES[1:]
+    assert " ".join(m["text"] for m in resent).split() == " ".join(rest).split()
+    assert [s for c, _, s in fake.spoken] == rest
     assert len(rec.of(TTSStoppedFrame)) == 1
+    assert not errors_in(up)
+
+
+async def test_a_socket_reopened_during_reconnect_backoff_is_read_at_once():
+    # The socket drops; the reconnect attempt right after it is refused, so
+    # Pipecat's reconnect loop sleeps (4 s or more) before trying again. The
+    # next utterance opens a socket itself, and its audio must not wait for
+    # that sleep to end.
+    fake = FakeMiraiWS(close_after=0.2, refuse_attempts={2})
+    async with fake.serve() as url:
+        rec, down, _ = await run(ws_tts(url), 8000, [SleepFrame(0.6), TTSSpeakFrame(TEXT), SleepFrame(0.5)])
+    assert fake.attempts == 3 and len(fake.conns) == 2
+    spoke_at = next(t for t, f in rec.seen if isinstance(f, TTSStartedFrame))
+    assert rec.audio and rec.audio[0][0] - spoke_at < 1.0
+    assert audio_of(down, 8000) == tone(0.5, 8000)
+
+
+async def test_base64_audio_events_are_played_too():
+    fake = FakeMiraiWS(base64=True, reads=(1001, 640))
+    async with fake.serve() as url:
+        _, down, up = await run(ws_tts(url), 16000, [TTSSpeakFrame(TEXT)])
+    assert audio_of(down, 16000) == tone(0.5, 16000)
     assert not errors_in(up)
 
 
