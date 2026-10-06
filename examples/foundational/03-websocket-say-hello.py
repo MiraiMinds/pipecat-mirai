@@ -11,9 +11,9 @@
 """Stream a reply into Mirai over one WebSocket, as an LLM would, and save it.
 
     export MIRAI_API_KEY=sk_live_...
-    uv run examples/foundational/02-websocket-say-hello.py --voice shruti
+    uv run examples/foundational/03-websocket-say-hello.py --voice shruti
 
-From a checkout of this repository, `uv run python examples/foundational/02-websocket-say-hello.py`
+From a checkout of this repository, `uv run python examples/foundational/03-websocket-say-hello.py`
 uses the local package instead.
 
 The text goes to `MiraiWebsocketTTSService` a few words at a time, the way an

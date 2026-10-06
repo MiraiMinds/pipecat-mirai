@@ -288,7 +288,7 @@ keeps up even when many calls share one link.
 
 - [`examples/foundational/01-say-hello.py`](examples/foundational/01-say-hello.py):
   a minimal Pipecat pipeline that speaks one line and saves `hello.wav`.
-- [`examples/foundational/02-websocket-say-hello.py`](examples/foundational/02-websocket-say-hello.py):
+- [`examples/foundational/03-websocket-say-hello.py`](examples/foundational/03-websocket-say-hello.py):
   stream a reply into `MiraiWebsocketTTSService` a few words at a time, as an
   LLM would, and save it.
 - [`examples/foundational/02-realtime-conversation.py`](examples/foundational/02-realtime-conversation.py):

@@ -21,7 +21,7 @@ All notable changes to this project are documented here. The format follows
   every `keepalive_secs` (30 s). TTFB is measured at the first audio byte;
   usage metrics are the characters Mirai billed.
 - `DEFAULT_WEBSOCKET_URL`, and the example
-  `examples/foundational/02-websocket-say-hello.py`.
+  `examples/foundational/03-websocket-say-hello.py`.
 - `MiraiTTSService` asks Mirai for audio at the pipeline's output rate (8, 16,
   22.05, 24, 44.1 or 48 kHz) with the request's `sample_rate` field. An 8 kHz phone pipeline now
   downloads 128 kbit/s per call instead of 768 kbit/s.
