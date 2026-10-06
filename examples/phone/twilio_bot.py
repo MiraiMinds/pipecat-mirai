@@ -68,6 +68,8 @@ async def call(websocket: WebSocket):
     )
     apply_output_lead(transport)  # send up to 0.4 s ahead so a busy server never starves the call
 
+    # The pipeline runs at 8 kHz, so Mirai is asked for 8 kHz audio: a sixth of the
+    # data of 48 kHz per call, and nothing to resample here.
     tts = MiraiTTSService(settings=MiraiTTSService.Settings(voice="shruti"))
     worker = PipelineWorker(
         Pipeline([transport.input(), tts, transport.output()]),
