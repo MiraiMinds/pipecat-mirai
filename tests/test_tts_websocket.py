@@ -307,8 +307,22 @@ async def test_interruption_cancels_once_and_nothing_leaks_into_the_next_context
     # streaming for another 200 ms (frames already in flight) before its ack.
     fake = FakeMiraiWS(seconds={"लंबा जवाब।": 20.0, "छोटा।": 0.5}, reads=(3200,), pace=0.05, cancel_delay=0.2)
     async with fake.serve() as url:
+        tts = ws_tts(url)
+        # What the service itself hands Pipecat, and when it cancelled.
+        appended, cancelled = [], []
+        append, cancel_turn = tts.append_to_audio_context, tts._cancel_turn
+
+        async def spy_append(context_id, frame):
+            appended.append((time.monotonic(), context_id, frame))
+            await append(context_id, frame)
+
+        async def spy_cancel(turn):
+            cancelled.append(time.monotonic())
+            await cancel_turn(turn)
+
+        tts.append_to_audio_context, tts._cancel_turn = spy_append, spy_cancel
         rec, _, up = await run(
-            ws_tts(url),
+            tts,
             8000,
             [
                 TTSSpeakFrame("लंबा जवाब।"),
@@ -333,6 +347,9 @@ async def test_interruption_cancels_once_and_nothing_leaks_into_the_next_context
     # ...but after the interruption only the next context's audio, all of it.
     assert after and {f.context_id for f in after} == {fake.messages("text")[1]["context_id"]}
     assert b"".join(f.audio for f in after) == tone(0.5, 8000)
+    # The service itself dropped the audio that kept arriving for the cancelled
+    # context (Pipecat would discard it too; this checks the service's own guard).
+    assert not [c for t, c, f in appended if t > cancelled[0] and c == long_id]
     assert not errors_in(up)
 
 
