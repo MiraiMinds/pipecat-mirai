@@ -14,11 +14,13 @@ from pipecat_mirai.realtime import (
     MiraiTurnMetrics,
 )
 from pipecat_mirai.tts import VOICES, MiraiTTSService, MiraiTTSSettings
+from pipecat_mirai.tts_websocket import DEFAULT_WEBSOCKET_URL, MiraiWebsocketTTSService
 
 __version__ = "0.3.0"
 
 __all__ = [
     "DEFAULT_LEAD_SECS",
+    "DEFAULT_WEBSOCKET_URL",
     "PRODUCTION_REALTIME_URL",
     "SANDBOX_REALTIME_URL",
     "VOICES",
@@ -26,6 +28,7 @@ __all__ = [
     "MiraiTTSService",
     "MiraiTTSSettings",
     "MiraiTurnMetrics",
+    "MiraiWebsocketTTSService",
     "__version__",
     "apply_output_lead",
 ]
