@@ -384,6 +384,12 @@ class MiraiWebsocketTTSService(WebsocketTTSService):
         async with self._connect_lock:
             if self._is_open():
                 return
+            if self._websocket is not None:
+                # The socket died and this noticed before the receive task did:
+                # settle what was on it, so it is resent below.
+                dead, self._websocket = self._websocket, None
+                await self._abandon_turns(intentional=False)
+                await _close_quietly(dead)
             logger.debug(f"{self}: connecting to {self._url}")
             self._websocket = await self._websocket_connect(
                 self._url, additional_headers=self._headers, max_size=MAX_MESSAGE_BYTES
@@ -407,11 +413,8 @@ class MiraiWebsocketTTSService(WebsocketTTSService):
         await self._abandon_turns(intentional=self._disconnecting)
         if websocket is None:
             return
-        try:
-            # A plain close: Mirai drops (and doesn't bill) anything unsent.
-            await websocket.close()
-        except Exception as exc:
-            logger.debug(f"{self}: error closing the socket: {exc!r}")
+        # A plain close: Mirai drops (and doesn't bill) anything unsent.
+        await _close_quietly(websocket)
         logger.debug(f"{self}: disconnected from Mirai")
         await self._call_event_handler("on_disconnected")
 
@@ -490,11 +493,13 @@ class MiraiWebsocketTTSService(WebsocketTTSService):
         try:
             await self._send(msg)
         except Exception as exc:
-            if flush:
-                turn.marks -= 1
-            self.last_error = f"Mirai TTS: could not send text: {exc}"
-            yield ErrorFrame(error=self.last_error, exception=exc, category=ErrorCategory.CONNECTIVITY)
-            return
+            # The socket died under us. Reconnecting settles this turn (the
+            # text just recorded is resent once, with the rest of the reply).
+            logger.warning(f"{self}: could not send text ({exc!r}); reconnecting")
+            await self._connect()
+            if not self._is_open():
+                yield ErrorFrame(error=self.last_error or f"Mirai TTS: could not send text: {exc}")
+                return
         yield None
 
     async def flush_audio(self, context_id: str | None = None):
@@ -517,9 +522,9 @@ class MiraiWebsocketTTSService(WebsocketTTSService):
             try:
                 await self._send({"type": "flush", "context_id": turn.server_id})
             except Exception as exc:
-                turn.marks -= 1
-                logger.warning(f"{self}: could not flush context {turn.id}: {exc!r}")
-                return  # the reconnect resends it, flushed
+                logger.warning(f"{self}: could not flush context {turn.id} ({exc!r}); reconnecting")
+                await self._connect()  # resends the rest of the turn, flushed
+                return
         await self._maybe_complete(turn)
 
     async def _update_settings(self, delta: TTSSettings) -> dict[str, Any]:
@@ -870,6 +875,13 @@ class MiraiWebsocketTTSService(WebsocketTTSService):
     async def _report(self, message: str, category: ErrorCategory):
         self.last_error = message
         await self.push_error(error_msg=message, category=category)
+
+
+async def _close_quietly(websocket):
+    try:
+        await websocket.close()
+    except Exception as exc:
+        logger.debug(f"error closing a Mirai socket: {exc!r}")
 
 
 def _error_detail(body: Any) -> str | None:

@@ -470,6 +470,72 @@ async def test_a_socket_reopened_during_reconnect_backoff_is_read_at_once():
     assert audio_of(down, 8000) == tone(0.5, 8000)
 
 
+@pytest.mark.parametrize("settle", [0.0, 0.05])
+async def test_text_sent_on_a_dead_socket_is_resent_on_a_new_one(settle):
+    # The socket dies just as a sentence is sent: whichever notices first
+    # (the send, or the receive task), the sentence is spoken once.
+    fake = FakeMiraiWS()
+    async with fake.serve() as url:
+        tts = ws_tts(url)
+
+        async def kill_on_first_text():
+            while tts._websocket is None:
+                await asyncio.sleep(0.005)
+            ws = tts._websocket
+            real_send = ws.send
+
+            async def send(message):
+                ws.send = real_send
+                if '"type": "text"' in message:
+                    ws.transport.abort()
+                    await asyncio.sleep(settle)
+                return await real_send(message)
+
+            ws.send = send
+
+        killer = asyncio.create_task(kill_on_first_text())
+        _, down, up = await run(tts, 8000, [SleepFrame(0.2), TTSSpeakFrame(TEXT), SleepFrame(0.5)])
+        killer.cancel()
+    assert len(fake.conns) == 2
+    assert not fake.messages("text", conn=1)
+    assert [m["text"] for m in fake.messages("text", conn=2)] == [TEXT]
+    assert audio_of(down, 8000) == tone(0.5, 8000)
+    assert not errors_in(up)
+
+
+async def test_a_dead_socket_found_by_a_send_settles_the_reply_on_it():
+    # The socket dies while the receive task is busy, so the next sentence's
+    # send is what finds it dead. The reply that was on it must not be lost:
+    # it is resent on the new socket, ahead of the new sentence.
+    first, second = "पहला वाक्य यह है।", "दूसरा वाक्य यह है।"
+    fake = FakeMiraiWS()
+    async with fake.serve() as url:
+        tts = ws_tts(url)
+        release = asyncio.Event()
+        on_audio_start = tts._on_audio_start
+
+        async def die_while_busy(event):
+            if not release.is_set():
+                tts._websocket.transport.abort()
+                await release.wait()
+            await on_audio_start(event)
+
+        async def release_later():
+            await asyncio.sleep(0.6)
+            release.set()
+
+        tts._on_audio_start = die_while_busy
+        releaser = asyncio.create_task(release_later())
+        _, down, up = await run(
+            tts, 8000, [TTSSpeakFrame(first), SleepFrame(0.2), TTSSpeakFrame(second), SleepFrame(1.0)]
+        )
+        releaser.cancel()
+    assert len(fake.conns) == 2
+    assert [m["text"] for m in fake.messages("text", conn=2)] == [first, second]
+    assert audio_of(down, 8000) == tone(0.5, 8000) * 2
+    assert not errors_in(up)
+
+
 async def test_base64_audio_events_are_played_too():
     fake = FakeMiraiWS(base64=True, reads=(1001, 640))
     async with fake.serve() as url:
