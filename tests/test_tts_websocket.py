@@ -222,6 +222,8 @@ async def test_token_mode_streams_tokens_and_flushes_at_the_end():
     assert [s for _, _, s in fake.spoken] == SENTENCES
     assert audio_of(down, 8000) == b"".join(tone(0.4, 8000) for _ in SENTENCES)
     assert len(rec.of(TTSStoppedFrame)) == 1
+    # The assistant's transcript still gets the whole reply.
+    assert "".join(f.text for f in rec.of(TTSTextFrame)).split() == "".join(TOKENS).split()
     # Usage is what Mirai billed, once per sentence, and nothing else.
     usage = [d.value for f in rec.of(MetricsFrame) for d in f.data if isinstance(d, TTSUsageMetricsData)]
     assert usage == [11, 11, 11]
