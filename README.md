@@ -1,12 +1,14 @@
 # pipecat-mirai
 
-[Mirai](https://miraiminds.co) text-to-speech for [Pipecat](https://github.com/pipecat-ai/pipecat)
-voice agents: natural Hindi, Hinglish and Gujarati voices, streamed with about
-100 ms to first audio.
+[Mirai](https://miraiminds.co) for [Pipecat](https://github.com/pipecat-ai/pipecat)
+voice agents: natural Hindi, Hinglish and Gujarati voices.
 
-- **`MiraiTTSService`**: a Pipecat TTS service for Mirai's streaming API. Audio is
-  resampled to your pipeline's rate (8 kHz for phone calls), with no voice
-  registration or sample-rate workarounds.
+- **`MiraiTTSService`**: a Pipecat TTS service for Mirai's streaming API, about
+  100 ms to first audio. Audio is resampled to your pipeline's rate (8 kHz for
+  phone calls), with no voice registration or sample-rate workarounds.
+- **`MiraiRealtimeLLMService`**: hand Mirai the whole turn. Speech recognition,
+  turn detection, the model and the voice run together on Mirai's side, and
+  this one service replaces your STT, LLM and TTS (see [Realtime](#realtime)).
 - **`apply_output_lead()`**: stops audio breaking up on phone calls when your
   server is busy (see [Phone calls](#phone-calls)). This works with any TTS service.
 
@@ -65,6 +67,49 @@ await task.queue_frame(TTSUpdateSettingsFrame(delta=MiraiTTSService.Settings(voi
 The service reports time-to-first-byte and character usage metrics and supports
 Pipecat tracing. Interrupting the bot closes the HTTP stream at once.
 
+## Realtime
+
+Mirai's [Realtime API](https://docs.miraiminds.co/v2/realtime) speaks the OpenAI
+Realtime protocol. `MiraiRealtimeLLMService` is Pipecat's own
+`OpenAIRealtimeLLMService`, set up for Mirai. It replaces your STT, LLM and TTS
+services, and your transport and context aggregators stay as they are:
+
+```python
+from pipecat_mirai import MiraiRealtimeLLMService
+
+llm = MiraiRealtimeLLMService(voice="shruti", language="hi")
+
+pipeline = Pipeline([transport.input(), user_aggregator, llm, transport.output(), assistant_aggregator])
+```
+
+Each turn makes one round trip to your server instead of three, and a session is
+billed per minute like a browser call. On top of the stock service, it:
+
+- builds the session URL for you: `agent_id`, `variables`, `metadata`,
+  `webhook_url` and `max_duration_secs` are plain arguments;
+- sends the `mirai` settings block (`language`, `temperature`, `tool_timeout_ms`,
+  ...), which stock `SessionProperties` drops;
+- handles Mirai's own events, which make stock Pipecat stop reading the socket,
+  and reports each turn's timing through `on_turn_metrics`;
+- resamples caller audio to the 24 kHz the protocol uses, so an 8 kHz phone
+  pipeline works without changing `audio_in_sample_rate`.
+
+```python
+llm = MiraiRealtimeLLMService(
+    agent_id="agt_...",                    # start from one of your agents
+    variables={"customer_name": "Rahul"},  # its {{placeholders}}
+    mirai={"temperature": 0.3},
+)
+
+@llm.event_handler("on_turn_metrics")
+async def on_turn_metrics(service, m):
+    print(f"{m.v2v_ms} ms voice to voice, providers {m.providers}")
+```
+
+It connects to the sandbox (`SANDBOX_REALTIME_URL`) by default, which is what a
+sandbox key needs. Pass `base_url=PRODUCTION_REALTIME_URL` once your company has
+gone live.
+
 ## Phone calls
 
 Pipecat's websocket transports (`FastAPIWebsocketTransport` with Twilio, Plivo,
@@ -104,8 +149,12 @@ actually stops hearing the bot.
 
 - [`examples/foundational/01-say-hello.py`](examples/foundational/01-say-hello.py):
   a minimal Pipecat pipeline that speaks one line and saves `hello.wav`.
+- [`examples/foundational/02-realtime-conversation.py`](examples/foundational/02-realtime-conversation.py):
+  talk to a Realtime session from your microphone, with per-turn timing.
 - [`examples/phone/twilio_bot.py`](examples/phone/twilio_bot.py): a Twilio Media
-  Streams bot with `apply_output_lead`.
+  Streams bot with `MiraiTTSService` and `apply_output_lead`.
+- [`examples/phone/twilio_realtime_bot.py`](examples/phone/twilio_realtime_bot.py):
+  the same phone line on the Realtime API.
 
 ## Compatibility
 
