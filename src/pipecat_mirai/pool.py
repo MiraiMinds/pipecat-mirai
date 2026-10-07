@@ -52,6 +52,8 @@ from loguru import logger
 from websockets.asyncio.client import connect as websocket_connect
 from websockets.protocol import State
 
+from ._net import hedge_transport, websocket_connect_kwargs
+
 # ---- HTTP ----
 # Mirai's gateway (nginx) closes an HTTP connection after 75 s idle. The client
 # drops one at 70 s, so a request is never sent on a connection being closed.
@@ -266,11 +268,13 @@ class _SlotTransport(httpx.AsyncBaseTransport):
     def new_slot(self) -> _Slot:
         if self._ssl is None:
             self._ssl = _ssl_context()
-        transport = httpx.AsyncHTTPTransport(
-            verify=self._ssl,
-            limits=httpx.Limits(
-                max_connections=1, max_keepalive_connections=1, keepalive_expiry=HTTP_KEEPALIVE_EXPIRY
-            ),
+        transport = hedge_transport(
+            httpx.AsyncHTTPTransport(
+                verify=self._ssl,
+                limits=httpx.Limits(
+                    max_connections=1, max_keepalive_connections=1, keepalive_expiry=HTTP_KEEPALIVE_EXPIRY
+                ),
+            )
         )
         slot = _Slot(transport)
         self.slots.append(slot)
@@ -781,12 +785,14 @@ class WebsocketPool:
         """Open a socket and wait for session.ready (``opening`` was counted by the caller)."""
         websocket = None
         try:
+            extra = await asyncio.wait_for(websocket_connect_kwargs(self.url), WS_OPEN_TIMEOUT)
             websocket = await websocket_connect(
                 self.url,
                 additional_headers=self.headers,
                 max_size=self.max_size,
                 open_timeout=WS_OPEN_TIMEOUT,
                 close_timeout=WS_CLOSE_TIMEOUT,
+                **extra,
             )
             raw = await asyncio.wait_for(websocket.recv(), WS_OPEN_TIMEOUT)
             event = json.loads(raw) if isinstance(raw, str) else {}

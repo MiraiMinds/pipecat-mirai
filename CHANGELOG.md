@@ -22,6 +22,15 @@ All notable changes to this project are documented here. The format follows
   Mirai's maximum session length, is replaced. `shared_pool=False` always
   connects.
 - `shared_connection_stats()` and `close_shared_connections()`.
+- Hedged connects: a TCP connect to Mirai that hasn't completed after 300 ms
+  starts a second attempt (and a third at 1 s); the first to connect is used and
+  the rest are closed. A burst of new connections, as when many calls start at
+  once, can lose SYNs on some network paths, and each lost SYN otherwise costs a
+  1 s (then 3 s) retransmit. `MIRAI_CONNECT_HEDGE_MS` sets the delay; `0` turns
+  it off. Not used for WebSockets when an HTTP(S) proxy is configured.
+- The output lead (0.4 s) is applied automatically to the pipeline's output
+  transport when the service starts; `apply_output_lead` is no longer needed
+  (calling it as well is harmless). `output_lead_secs=None` turns it off.
 - `benchmarks/burst-start`: K pipelines starting at the same instant, in one or
   more processes, with each call's greeting and later-sentence TTFB.
 

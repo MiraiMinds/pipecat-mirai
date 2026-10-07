@@ -54,6 +54,7 @@ from pipecat.utils.tracing.service_decorators import traced_tts
 from websockets.exceptions import InvalidHandshake
 from websockets.protocol import State
 
+from pipecat_mirai._net import websocket_connect_kwargs
 from pipecat_mirai.pacing import DEFAULT_LEAD_SECS, ensure_output_lead
 from pipecat_mirai.pool import (
     SharedHTTPClient,
@@ -555,8 +556,9 @@ class MiraiWebsocketTTSService(_HTTPSpeech, WebsocketTTSService):
                     self._idle_timeout_secs = pooled.idle_timeout_secs
             else:
                 logger.debug(f"{self}: connecting to {self._url}")
+                extra = await asyncio.wait_for(websocket_connect_kwargs(self._url), 10.0)
                 self._websocket = await self._websocket_connect(
-                    self._url, additional_headers=self._headers, max_size=MAX_MESSAGE_BYTES
+                    self._url, additional_headers=self._headers, max_size=MAX_MESSAGE_BYTES, **extra
                 )
             self._cancelled.clear()
             self._sentence = None
