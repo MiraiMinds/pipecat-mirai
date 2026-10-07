@@ -8,6 +8,20 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- `MiraiWebsocketTTSService`: Mirai TTS over one WebSocket for the whole call
+  (`/v1/audio/speech/stream`), so no sentence waits for a TCP and TLS
+  handshake. Each sentence is sent as soon as Pipecat has it (or each token,
+  with `TextAggregationMode.TOKEN`, and Mirai cuts the sentences), and Mirai
+  synthesises the next sentence while the current one plays. Same voices,
+  settings, output-rate audio, 40 ms framing and first-audio buffer as
+  `MiraiTTSService`. An interruption cancels the reply on Mirai and drops any
+  of its audio still arriving. A capacity error with a retry time of up to 5 s
+  is retried once. A dropped socket is reopened and a reply it cut short is
+  resent once. A quiet socket is kept open with an empty `session.update`
+  every `keepalive_secs` (30 s). TTFB is measured at the first audio byte;
+  usage metrics are the characters Mirai billed.
+- `DEFAULT_WEBSOCKET_URL`, and the example
+  `examples/foundational/03-websocket-say-hello.py`.
 - `MiraiTTSService` asks Mirai for audio at the pipeline's output rate (8, 16,
   22.05, 24, 44.1 or 48 kHz) with the request's `sample_rate` field. An 8 kHz phone pipeline now
   downloads 128 kbit/s per call instead of 768 kbit/s.

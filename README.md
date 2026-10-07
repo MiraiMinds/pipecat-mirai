@@ -6,6 +6,9 @@ voice agents: natural Hindi, Hinglish and Gujarati voices.
 - **`MiraiTTSService`**: a Pipecat TTS service for Mirai's streaming API, about
   100 ms to first audio. Mirai sends audio at your pipeline's rate (8 kHz for
   phone calls), with no voice registration or sample-rate workarounds.
+- **`MiraiWebsocketTTSService`**: the same voices over one WebSocket for the
+  whole call, so no sentence waits for a connection (see
+  [WebSocket](#websocket-lowest-latency)).
 - **`MiraiRealtimeLLMService`**: hand Mirai the whole turn. Speech recognition,
   turn detection, the model and the voice run together on Mirai's side, and
   this one service replaces your STT, LLM and TTS (see [Realtime](#realtime)).
@@ -135,6 +138,68 @@ When the bot is interrupted, the service closes the utterance's HTTP stream at
 once, so Mirai stops generating it. Audio not yet pushed is dropped, and nothing
 from the interrupted utterance reaches the next one.
 
+## WebSocket (lowest latency)
+
+`MiraiTTSService` sends one HTTPS request per sentence. It keeps the connection
+alive, but whenever a request finds it gone, that sentence waits for a new TCP
+and TLS handshake (0.4–1 s from India). `MiraiWebsocketTTSService` opens one
+WebSocket to Mirai when the pipeline starts and sends the whole call over it,
+so that cost is paid once, before the bot says anything.
+
+```python
+from pipecat_mirai import MiraiWebsocketTTSService
+
+tts = MiraiWebsocketTTSService(settings=MiraiWebsocketTTSService.Settings(voice="shruti"))
+
+pipeline = Pipeline([transport.input(), stt, user_aggregator, llm, tts, transport.output(), assistant_aggregator])
+```
+
+It takes the place of `MiraiTTSService` with nothing else changed: the same
+voices and settings, audio at your pipeline's rate, 40 ms frames and the 150 ms
+first-audio buffer (here, at the start of each sentence). Billing is the same
+too: each sentence Mirai delivers is billed per character, as on the HTTP
+endpoint.
+
+**How text reaches Mirai.** By default Pipecat collects the LLM's reply a
+sentence at a time, and each sentence is sent the moment it is complete. Mirai
+speaks them in order and starts synthesising the next one while the current
+one plays, so there is no pause between sentences. With
+`text_aggregation_mode=TextAggregationMode.TOKEN`, every LLM token goes to
+Mirai as it arrives and Mirai cuts the sentences itself. It knows the danda
+(।), abbreviations like "Rs." and "Dr.", and numbers like 3.5.
+
+**What the service handles for you:**
+
+- **Interruptions.** The reply is cancelled on Mirai straight away, and you
+  aren't billed for the sentence that was cut off. Audio from it that is still
+  on its way is dropped, so none of it plays after the interruption.
+- **Capacity.** If Mirai is briefly at capacity and says when to try again (up
+  to 5 s), the service waits that long and sends the rest of the reply once
+  more. Otherwise the error goes up the pipeline as an `ErrorFrame` and Mirai
+  carries on with the next sentence.
+- **Dropped connections.** The socket is reopened at once (Pipecat's reconnect,
+  with backoff after a failed attempt). A reply the drop cut short is sent
+  again once, from the first sentence the caller hadn't started hearing.
+- **Quiet calls.** Mirai closes a socket that has sent nothing for 120 s. After
+  `keepalive_secs` (30 s) of quiet, the service sends an empty
+  `session.update`, which changes nothing and keeps the socket open.
+- **Metrics.** Time to first byte is measured at the first audio byte of each
+  reply. Usage metrics are the characters Mirai billed for each sentence.
+
+| Argument | Default | |
+|---|---|---|
+| `api_key` | `$MIRAI_API_KEY` | Sent as `Authorization: Bearer` when the socket opens |
+| `url` | `wss://sandbox.voice.miraiminds.co/v1/audio/speech/stream` | The streaming endpoint |
+| `settings`, `voice`, `model` | `voice="neha"`, `model="mira-tts"` | As for `MiraiTTSService`. A new voice applies from the next sentence |
+| `sample_rate`, `server_sample_rate` | pipeline rate, `"auto"` | As for `MiraiTTSService`. Each sentence's rate is read from Mirai's `audio.start` |
+| `prebuffer_secs` | `0.15` | Audio collected before a sentence starts playing |
+| `keepalive_secs` | `30` | Keep a quiet socket open; `None` turns it off |
+| `text_aggregation_mode` | sentence | `TextAggregationMode.TOKEN` sends every token as it arrives |
+
+`tts.session_id` is the socket's id (`ttsws_…`), and `tts.last_server_sample_rate`
+the rate of the latest sentence. Pipecat's `on_connected`, `on_disconnected` and
+`on_connection_error` events fire as the socket opens and closes.
+
 ## Realtime
 
 Mirai's [Realtime API](https://docs.miraiminds.co/v2/realtime) speaks the OpenAI
@@ -223,6 +288,9 @@ keeps up even when many calls share one link.
 
 - [`examples/foundational/01-say-hello.py`](examples/foundational/01-say-hello.py):
   a minimal Pipecat pipeline that speaks one line and saves `hello.wav`.
+- [`examples/foundational/03-websocket-say-hello.py`](examples/foundational/03-websocket-say-hello.py):
+  stream a reply into `MiraiWebsocketTTSService` a few words at a time, as an
+  LLM would, and save it.
 - [`examples/foundational/02-realtime-conversation.py`](examples/foundational/02-realtime-conversation.py):
   talk to a Realtime session from your microphone, with per-turn timing.
 - [`examples/phone/twilio_bot.py`](examples/phone/twilio_bot.py): a Twilio Media
