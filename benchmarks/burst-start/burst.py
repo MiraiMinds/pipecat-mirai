@@ -16,6 +16,9 @@ one shared instant, after its own start-up:
                          (on 0.3.1, shared_pool=False)
     --variant prewarm    start-up awaits pipecat_mirai.prewarm() for this
                          process's calls (HTTP connections or sockets)
+    --variant default    0.3.1 defaults only: no prewarm() call, nothing configured.
+                         Use --rounds 2 to see a worker's first (cold) burst and a
+                         later burst after --round-gap seconds idle.
 
 Per call it records, for the greeting, the time from the call's start to the
 first audio byte (the handshake a WebSocket service pays at start is in
@@ -188,15 +191,21 @@ def worker_main(a):
         line = await asyncio.get_running_loop().run_in_executor(None, sys.stdin.readline)
         t0 = float(line.split()[1])
         await asyncio.sleep(max(0.0, t0 - time.monotonic()))
-        rng = random.Random(a.seed * 100 + a.index)
-        calls = await asyncio.gather(
-            *(one_call(a.index * 1000 + i, t0, rng) for i in range(a.calls)), return_exceptions=True
-        )
         out = []
-        for c in calls:
-            if isinstance(c, BaseException):
-                out.append({"errors": [repr(c)], "turns": []})
-            else:
+        for rnd in range(a.rounds):
+            if rnd:
+                await asyncio.sleep(a.round_gap)  # the worker sits idle between load-test rounds
+                t0 = time.monotonic() + 0.2
+                await asyncio.sleep(0.2)
+            rng = random.Random(a.seed * 100 + a.index + rnd * 7919)
+            calls = await asyncio.gather(
+                *(one_call(a.index * 1000 + rnd * 100 + i, t0, rng) for i in range(a.calls)),
+                return_exceptions=True,
+            )
+            for c in calls:
+                if isinstance(c, BaseException):
+                    c = {"errors": [repr(c)], "turns": []}
+                c["round"] = rnd
                 out.append(c)
         stats = None
         if hasattr(pipecat_mirai, "shared_connection_stats"):
@@ -271,6 +280,7 @@ def main(a):
             "--base-url", a.base_url, "--voice", a.voice, "--sentences", str(a.sentences),
             "--pause-min", str(a.pause_min), "--pause-max", str(a.pause_max), "--seed", str(a.seed),
             "--log-level", a.log_level, "--out", a.out,
+            "--rounds", str(a.rounds), "--round-gap", str(a.round_gap),
         ]  # fmt: skip
         if a.ws_url:
             args += ["--ws-url", a.ws_url]
@@ -295,9 +305,21 @@ def main(a):
         for line in p.stdout:
             if line.startswith("result "):
                 results.append(json.loads(line[len("result ") :]))
-        p.wait(timeout=180)
+        p.wait(timeout=180 + a.rounds * (120 + a.round_gap))
 
     calls = [c for r in results for c in r["calls"]]
+    per_round = {}
+    for rnd in range(a.rounds):
+        g, lt = [], []
+        for c in calls:
+            if c.get("round", 0) != rnd:
+                continue
+            for t in c.get("turns", []):
+                if t["k"] == 0 and "t_first_byte" in t:
+                    g.append(t["t_first_byte"])
+                elif t["k"] and "ttfb" in t:
+                    lt.append(t["ttfb"])
+        per_round[rnd] = {"greeting_from_call_start_ms": summarize(g), "later_ttfb_ms": summarize(lt)}
     greet_start, greet_ttfb, later_ttfb, started, errors, timeouts = [], [], [], [], [], 0
     for c in calls:
         errors += c.get("errors", [])
@@ -324,6 +346,7 @@ def main(a):
         "greeting_from_call_start_ms": summarize(greet_start),
         "greeting_ttfb_ms": summarize(greet_ttfb),
         "later_ttfb_ms": summarize(later_ttfb),
+        "per_round": per_round,
         "errors": len(errors),
         "error_samples": errors[:5],
         "timeouts": timeouts,
@@ -336,7 +359,9 @@ def main(a):
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--tts", choices=["http", "ws"], default="http")
-    p.add_argument("--variant", choices=["baseline", "prewarm"], default="prewarm")
+    p.add_argument("--variant", choices=["baseline", "prewarm", "default"], default="prewarm")
+    p.add_argument("--rounds", type=int, default=1, help="bursts per worker process")
+    p.add_argument("--round-gap", type=float, default=20.0, help="idle seconds between bursts")
     p.add_argument("--calls", type=int, default=12, help="pipelines in all (K)")
     p.add_argument("--procs", type=int, default=1, help="processes the calls are split across")
     p.add_argument("--base-url", default="https://sandbox.voice.miraiminds.co/v1")
