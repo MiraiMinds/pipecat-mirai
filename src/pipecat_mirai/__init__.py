@@ -7,6 +7,8 @@
 """Mirai text-to-speech and Realtime API for Pipecat."""
 
 from pipecat_mirai.pacing import DEFAULT_LEAD_SECS, apply_output_lead
+from pipecat_mirai.pool import close_shared_connections, shared_connection_stats
+from pipecat_mirai.prewarm import PrewarmResult, prewarm
 from pipecat_mirai.realtime import (
     PRODUCTION_REALTIME_URL,
     SANDBOX_REALTIME_URL,
@@ -16,7 +18,7 @@ from pipecat_mirai.realtime import (
 from pipecat_mirai.tts import VOICES, MiraiTTSService, MiraiTTSSettings
 from pipecat_mirai.tts_websocket import DEFAULT_WEBSOCKET_URL, MiraiWebsocketTTSService
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 __all__ = [
     "DEFAULT_LEAD_SECS",
@@ -29,6 +31,10 @@ __all__ = [
     "MiraiTTSSettings",
     "MiraiTurnMetrics",
     "MiraiWebsocketTTSService",
+    "PrewarmResult",
     "__version__",
     "apply_output_lead",
+    "close_shared_connections",
+    "prewarm",
+    "shared_connection_stats",
 ]

@@ -49,6 +49,13 @@ class FakeMirai:
     ``reads`` are the sizes of the pieces the body is sent in, ``pace`` the pause
     after each piece and ``first_gap`` the pause after the first one. ``seconds``
     is the length of the audio, or a dict from input text to length.
+
+    ``script`` (``serve()`` only) scripts successive speech requests, one dict
+    each, after which requests are answered normally: ``{"status": 429,
+    "retry_after": 0.2, "code": "at_capacity"}`` refuses one, ``{"reset":
+    True}`` drops the connection without answering, ``{"cut_after": n}``
+    sends ``n`` bytes of audio and then drops it. Every response carries an
+    ``X-Request-Id``.
     """
 
     def __init__(
@@ -65,6 +72,7 @@ class FakeMirai:
         pace=0.0,
         first_gap=0.0,
         models_error=None,
+        script=None,
     ):
         self.seconds = seconds
         self.honours_rate = honours_rate
@@ -77,6 +85,7 @@ class FakeMirai:
         self.pace = pace
         self.first_gap = first_gap
         self.models_error = models_error
+        self.script = list(script or [])
         self.requests = []  # {"method", "path", "headers", "json", "conn", "t", "sent", "cut_at"}
         self.connections = 0
 
@@ -93,6 +102,8 @@ class FakeMirai:
     def _respond(self, path, body):
         if path.endswith("/models"):
             return 200, {"content-type": "application/json"}, b'{"object": "list", "data": []}'
+        if not path.endswith("/audio/speech"):  # e.g. a WebSocket handshake to /audio/speech/stream
+            return 404, {"content-type": "application/json"}, _error_body("not found")
         req = json.loads(body)
         if self.rejects_rate and "sample_rate" in req:
             message = 'json: unknown field "sample_rate"'
@@ -170,12 +181,31 @@ class FakeMirai:
                         headers[k.strip().lower()] = v.strip()
                     body = await reader.readexactly(int(headers.get("content-length", "0")))
                     record = self._record(method, target, headers, body, conn)
+                    action = self.script.pop(0) if self.script and target.endswith("/audio/speech") else {}
+                    if action.get("reset"):
+                        writer.transport.abort()  # no response at all
+                        return
                     status, rheaders, payload = self._respond(target, body)
+                    rheaders = {**rheaders, "x-request-id": f"req_{len(self.requests)}"}
+                    if action.get("status"):
+                        status = action["status"]
+                        rheaders["content-type"] = "application/json"
+                        if "retry_after" in action:
+                            rheaders["retry-after"] = str(action["retry_after"])
+                        error = {
+                            "code": action.get("code", "error"),
+                            "message": action.get("message", "busy"),
+                        }
+                        payload = json.dumps({"error": error}).encode()
                     head = [f"HTTP/1.1 {status} {HTTPStatus(status).phrase}", "transfer-encoding: chunked"]
                     head += [f"{k}: {v}" for k, v in rheaders.items()]
                     writer.write(("\r\n".join(head) + "\r\n\r\n").encode())
                     try:
                         for piece, pause in self._pieces(payload):
+                            if "cut_after" in action and record["sent"] >= action["cut_after"]:
+                                await writer.drain()
+                                writer.transport.abort()  # mid-stream: the network dropped
+                                return
                             writer.write(f"{len(piece):x}\r\n".encode() + piece + b"\r\n")
                             await writer.drain()
                             record["sent"] += len(piece)
@@ -438,10 +468,12 @@ async def test_utterances_share_one_connection():
     assert not errors_in(up)
 
 
-async def test_warm_up_opens_the_connection_before_the_first_sentence():
+@pytest.mark.parametrize("shared_pool", [True, False])
+async def test_warm_up_opens_the_connection_before_the_first_sentence(monkeypatch, shared_pool):
+    monkeypatch.setenv("MIRAI_WARM_CONNECTIONS", "1")  # the shared pool keeps one open
     fake = FakeMirai()
     async with fake.serve() as url:
-        tts = MiraiTTSService(api_key="sk_test", base_url=url)
+        tts = MiraiTTSService(api_key="sk_test", base_url=url, shared_pool=shared_pool)
         _, up = await speak(tts, 8000, "पहला", "दूसरा", before=[SleepFrame(0.3)])
     assert [(r["method"], r["path"], r["conn"]) for r in fake.requests] == [
         ("GET", "/v1/models", 1),
@@ -474,9 +506,10 @@ def test_invalid_buffering_options_are_refused(bad):
 
 
 async def test_keep_warm_pings_an_idle_connection_only_while_the_pipeline_runs():
+    # A client of the service's own (the shared pool refreshes its connections itself).
     fake = FakeMirai()
     async with fake.serve() as url:
-        tts = MiraiTTSService(api_key="k", base_url=url, keep_warm_secs=1.0)
+        tts = MiraiTTSService(api_key="k", base_url=url, keep_warm_secs=1.0, shared_pool=False)
         await speak(tts, 8000, before=[SleepFrame(0.3)], after=[SleepFrame(2.6)])
         at_stop = len(fake.requests)
         await asyncio.sleep(1.5)
@@ -580,7 +613,7 @@ async def test_interruption_cuts_the_stream_and_nothing_leaks_into_the_next_sent
     fake = FakeMirai(seconds={"लंबा": 20.0, "छोटा": 0.5}, reads=(3200,), pace=0.05)
     rec = Recorder()
     async with fake.serve() as url:
-        tts = MiraiTTSService(api_key="k", base_url=url)
+        tts = MiraiTTSService(api_key="k", base_url=url, shared_pool=False)
         await run_test(
             Pipeline([tts, rec]),
             frames_to_send=[

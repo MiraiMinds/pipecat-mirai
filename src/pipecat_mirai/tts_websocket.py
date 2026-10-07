@@ -28,6 +28,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import time
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
@@ -47,17 +48,28 @@ from pipecat.frames.frames import (
 from pipecat.metrics.metrics import TTSUsageMetricsData
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.settings import TTSSettings
-from pipecat.services.tts_service import WebsocketTTSService
+from pipecat.services.tts_service import TTSService, WebsocketTTSService
 from pipecat.utils.errors import ErrorCategory
 from pipecat.utils.tracing.service_decorators import traced_tts
+from websockets.exceptions import InvalidHandshake
 from websockets.protocol import State
 
+from pipecat_mirai.pacing import DEFAULT_LEAD_SECS, ensure_output_lead
+from pipecat_mirai.pool import (
+    SharedHTTPClient,
+    WebsocketPool,
+    shared_http_client,
+    take_websocket,
+    websocket_pool,
+)
 from pipecat_mirai.tts import (
     FRAME_SECS,
     SERVER_SAMPLE_RATES,
     SOURCE_SAMPLE_RATE,
     VOICES,
     MiraiTTSSettings,
+    _check_server_rate,
+    _HTTPSpeech,
 )
 
 DEFAULT_WEBSOCKET_URL = "wss://sandbox.voice.miraiminds.co/v1/audio/speech/stream"
@@ -87,6 +99,23 @@ _HANDSHAKE_CATEGORIES = {
     403: ErrorCategory.AUTHORIZATION,
     429: ErrorCategory.RATE_LIMIT,
 }
+# What to do about each, in one line.
+_ADVICE = {
+    "unauthorized": "Check MIRAI_API_KEY.",
+    "forbidden": "The API key is revoked or not allowed this request.",
+    "insufficient_balance": "The workspace is out of credit. Top it up in the Mirai console.",
+    "at_capacity": "Ask Mirai to raise this workspace's concurrency limit.",
+    "rate_limited": "Ask Mirai to raise the API key's request rate limit.",
+    "queue_full": "Ask Mirai to raise this workspace's concurrency limit.",
+    401: "Check MIRAI_API_KEY.",
+    402: "The workspace is out of credit. Top it up in the Mirai console.",
+    403: "The API key is revoked or not allowed this request.",
+    429: "Ask Mirai to raise the API key's request rate limit.",
+}
+# Where the HTTP fallback cuts streamed tokens into sentences, as Mirai does.
+_SENTENCE_END = re.compile(r"[.?!।॥…][\"')\]]*\s|\n")
+# Endpoints already reported as unavailable (the fallback is announced once per process).
+_fallback_announced: set[str] = set()
 
 
 @dataclass
@@ -152,10 +181,13 @@ class _Sentence:
     pushed: int = 0
 
 
-class MiraiWebsocketTTSService(WebsocketTTSService):
+class MiraiWebsocketTTSService(_HTTPSpeech, WebsocketTTSService):
     """Stream Mirai TTS over one WebSocket for the whole pipeline.
 
     The socket opens when the pipeline starts and carries every utterance.
+    Sockets are opened ahead of need by a pool shared by every service in the
+    process (see :mod:`pipecat_mirai.pool`), so a pipeline usually takes one
+    that is already open and authenticated and starts without a handshake.
     Text goes to Mirai as Pipecat produces it: each sentence as soon as it is
     aggregated (the default), or each LLM token with
     ``text_aggregation_mode=TextAggregationMode.TOKEN``. Mirai cuts sentences
@@ -166,7 +198,11 @@ class MiraiWebsocketTTSService(WebsocketTTSService):
     frames after a short first-audio buffer, like :class:`MiraiTTSService`.
     An interruption cancels the reply on the server at once and drops
     whatever of it is still arriving. A dropped connection is reopened, and
-    a reply it cut short is resent once.
+    a reply it cut short is resent once. If the streaming endpoint can't be
+    reached at all (refused, not found, a proxy that doesn't pass WebSockets),
+    the call speaks over Mirai's HTTP endpoint instead (``http_fallback``).
+    On a phone call over a websocket transport the service also lets the
+    transport send audio a little ahead of real time (``output_lead_secs``).
 
     Example::
 
@@ -193,6 +229,9 @@ class MiraiWebsocketTTSService(WebsocketTTSService):
         server_sample_rate: int | Literal["auto"] | None = "auto",
         prebuffer_secs: float = 0.15,
         keepalive_secs: float | None = 30.0,
+        shared_pool: bool = True,
+        output_lead_secs: float | None = DEFAULT_LEAD_SECS,
+        http_fallback: bool = True,
         settings: Settings | None = None,
         **kwargs,
     ):
@@ -223,6 +262,23 @@ class MiraiWebsocketTTSService(WebsocketTTSService):
                 empty ``session.update`` so Mirai doesn't close the socket as
                 idle during a long pause in the call (it closes after 120 s
                 without a message). ``None`` turns it off.
+            shared_pool: Take a socket the process's pool opened ahead of
+                need for this URL and API key when one is waiting (the
+                default), and connect only when none is; the first service to
+                start sets the pool going (see :mod:`pipecat_mirai.pool`). The
+                socket is this pipeline's alone and is closed when it ends.
+                ``False`` always connects and starts no pool.
+            output_lead_secs: When the pipeline starts, let the first output
+                transport after this service run up to this far ahead of real
+                time, as :func:`pipecat_mirai.apply_output_lead` does (phone
+                calls over Pipecat's websocket transports). ``None`` turns it
+                off.
+            http_fallback: If the streaming endpoint can't be reached (a
+                handshake answered 404, 426 or 5xx, refused, or timed out),
+                speak this call over Mirai's HTTP endpoint (``POST
+                /v1/audio/speech`` on the same host) instead of failing, and
+                log it once. Authentication, credit and rate-limit refusals
+                are reported, not worked around. ``False`` reports them all.
             settings: Runtime-updatable settings; values here win over the
                 ``voice``/``model`` shortcuts.
             **kwargs: Passed through to :class:`WebsocketTTSService`, e.g.
@@ -231,15 +287,9 @@ class MiraiWebsocketTTSService(WebsocketTTSService):
         key = api_key or os.getenv("MIRAI_API_KEY") or os.getenv("MIRA_API_KEY")
         if not key:
             raise ValueError("Set MIRAI_API_KEY or pass api_key to MiraiWebsocketTTSService.")
-        if not (
-            server_sample_rate is None
-            or server_sample_rate == "auto"
-            or (type(server_sample_rate) is int and server_sample_rate in SERVER_SAMPLE_RATES)
-        ):
-            raise ValueError(
-                f"server_sample_rate must be 'auto', None or one of "
-                f"{', '.join(map(str, SERVER_SAMPLE_RATES))}; got {server_sample_rate!r}"
-            )
+        _check_server_rate(server_sample_rate)
+        if output_lead_secs is not None and not output_lead_secs >= 0:
+            raise ValueError(f"output_lead_secs must be >= 0 or None; got {output_lead_secs!r}")
         if not prebuffer_secs >= 0:
             raise ValueError(f"prebuffer_secs must be >= 0; got {prebuffer_secs!r}")
         if keepalive_secs is not None and not keepalive_secs > 0:
@@ -267,6 +317,17 @@ class MiraiWebsocketTTSService(WebsocketTTSService):
         self._server_rate_option = server_sample_rate
         self._prebuffer_secs = float(prebuffer_secs)
         self._keepalive_secs = keepalive_secs
+        self._shared_pool = shared_pool
+        self._output_lead_secs = output_lead_secs
+        self._http_fallback = http_fallback
+        self._pool: WebsocketPool | None = None
+        # The HTTP fallback: the same host's speech endpoint, and why it is in use (None: it isn't).
+        self._init_http_speech()
+        self._http_base = _http_base(url)
+        self._speech_url = self._http_base + "/audio/speech"
+        self._shared_http: SharedHTTPClient | None = None
+        self._fallback: str | None = None
+        self._fallback_text: dict[str, str] = {}
         self._frame_bytes = 2
         self._prebuffer_bytes = 0
 
@@ -324,6 +385,10 @@ class MiraiWebsocketTTSService(WebsocketTTSService):
         requested = self._requested_server_rate()
         asked = f"{requested} Hz" if requested else f"its default {SOURCE_SAMPLE_RATE} Hz"
         logger.debug(f"{self}: asking Mirai for {asked} PCM; output {rate} Hz")
+        ensure_output_lead(self, self._output_lead_secs)
+        if self._shared_pool and self._pool is None:
+            self._pool = websocket_pool(self._url, self._headers, MAX_MESSAGE_BYTES)
+            self._pool.hold(self)  # the first one sets the pool going
         await self._connect()
 
     def _requested_server_rate(self) -> int | None:
@@ -346,9 +411,14 @@ class MiraiWebsocketTTSService(WebsocketTTSService):
 
     async def _connect(self):
         await super()._connect()
+        if self._fallback:
+            return
         try:
             await self._connect_websocket()
         except Exception as exc:
+            if self._can_fall_back(exc):
+                self._fall_back(exc)
+                return
             await self._report_connect_failure(exc)
         if self._websocket is not None:
             task = self._receive_task
@@ -372,12 +442,96 @@ class MiraiWebsocketTTSService(WebsocketTTSService):
 
     async def _disconnect(self):
         await super()._disconnect()
+        self._closing = True
         for name in ("_keepalive_task", "_receive_task"):
             task = getattr(self, name)
             setattr(self, name, None)
             if task is not None and task is not asyncio.current_task() and not task.done():
                 await self.cancel_task(task)
+        await self._close_streams()
         await self._disconnect_websocket()
+        self._release_shared()
+
+    async def cleanup(self):
+        """Release resources at pipeline teardown."""
+        try:
+            await super().cleanup()
+        finally:
+            self._release_shared()
+
+    def _release_shared(self):
+        if self._pool is not None:
+            pool, self._pool = self._pool, None
+            pool.release(self)
+        if self._shared_http is not None:
+            shared, self._shared_http = self._shared_http, None
+            shared.release(self)
+
+    # ---------- HTTP fallback ----------
+
+    def _can_fall_back(self, exc: Exception, *, transient: bool = True) -> bool:
+        """Whether ``exc`` says the streaming endpoint itself is unavailable.
+
+        Definitive: the endpoint isn't there or doesn't speak WebSocket (404,
+        405, 426, a broken handshake). Transient, counted only with
+        ``transient``: a 5xx, a refused connection, a timeout.
+        """
+        if not self._http_fallback:
+            return False
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status is not None:
+            return status in (404, 405, 426) or (transient and status >= 500)
+        if isinstance(exc, InvalidHandshake):
+            return True
+        return transient and isinstance(exc, OSError | TimeoutError)
+
+    def _fall_back(self, exc: Exception):
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        self._fallback = f"HTTP {status}" if status else repr(exc)
+        message = (
+            f"{self}: Mirai's streaming endpoint {self._url} is unavailable ({self._fallback}); "
+            f"speaking over {self._speech_url} instead. Calls work as before, with a TCP and TLS "
+            f"handshake now and then; set http_fallback=False to fail instead."
+        )
+        if self._url in _fallback_announced:
+            logger.debug(message)
+        else:
+            _fallback_announced.add(self._url)
+            logger.warning(message)
+
+    def _client(self):
+        if self._shared_http is None or self._shared_http.closed:
+            if self._shared_http is not None:
+                self._shared_http.release(self)
+            self._shared_http = shared_http_client(self._http_base)
+            self._shared_http.hold(self, warm=True, headers=self._headers)
+        return self._shared_http.client
+
+    def _after_cut(self):
+        if self._shared_http is not None:
+            self._shared_http.nudge()
+
+    async def _count_http_usage(self, text: str):
+        await TTSService.start_tts_usage_metrics(self, text)
+
+    async def _speak_over_http(self, text: str, context_id: str):
+        """Speak ``text`` over HTTP into the audio context, as the socket would."""
+        async for frame in self._speak_http(text, context_id, self._count_http_usage):
+            if not self.audio_context_available(context_id):
+                return  # interrupted
+            await self.append_to_audio_context(context_id, frame)
+
+    async def _fallback_tts(self, text: str, context_id: str):
+        if not self._is_streaming_tokens:
+            await self._speak_over_http(text, context_id)
+            return
+        # Tokens: cut sentences here, as Mirai's stream would; flush_audio speaks the rest.
+        pending = self._fallback_text.get(context_id, "") + text
+        while match := _SENTENCE_END.search(pending):
+            sentence, pending = pending[: match.end()], pending[match.end() :]
+            if sentence.strip():
+                await self._speak_over_http(sentence, context_id)
+        self._fallback_text[context_id] = pending
 
     async def _connect_websocket(self):
         """Open the socket and set up the session. Raises if it can't."""
@@ -390,10 +544,20 @@ class MiraiWebsocketTTSService(WebsocketTTSService):
                 dead, self._websocket = self._websocket, None
                 await self._abandon_turns(intentional=False)
                 await _close_quietly(dead)
-            logger.debug(f"{self}: connecting to {self._url}")
-            self._websocket = await self._websocket_connect(
-                self._url, additional_headers=self._headers, max_size=MAX_MESSAGE_BYTES
-            )
+            pooled = await take_websocket(self._url, self._headers) if self._shared_pool else None
+            if pooled is not None:
+                # Already open and authenticated; nothing else has used it.
+                # The session.update below sets this pipeline's voice and rate.
+                logger.debug(f"{self}: using waiting socket {pooled.session_id} to {self._url}")
+                self._websocket = pooled.websocket
+                self.session_id = pooled.session_id
+                if pooled.idle_timeout_secs:
+                    self._idle_timeout_secs = pooled.idle_timeout_secs
+            else:
+                logger.debug(f"{self}: connecting to {self._url}")
+                self._websocket = await self._websocket_connect(
+                    self._url, additional_headers=self._headers, max_size=MAX_MESSAGE_BYTES
+                )
             self._cancelled.clear()
             self._sentence = None
             await self._send(self._session_update())
@@ -404,9 +568,17 @@ class MiraiWebsocketTTSService(WebsocketTTSService):
                 await self._send_held(turn)
 
     async def _reconnect_websocket(self, attempt_number: int) -> bool:
-        if self._is_open():
+        if self._fallback or self._is_open():
             return True  # already reopened (by run_tts) while this waited to retry
-        return await super()._reconnect_websocket(attempt_number)
+        try:
+            return await super()._reconnect_websocket(attempt_number)
+        except Exception as exc:
+            # Mid-call: a 5xx or refused connection may be a restart, so
+            # Pipecat's reconnect gets a second try before the call moves to HTTP.
+            if not self._can_fall_back(exc, transient=attempt_number >= 2):
+                raise
+            self._fall_back(exc)  # the endpoint is gone: carry on over HTTP
+            return True
 
     async def _disconnect_websocket(self):
         websocket, self._websocket = self._websocket, None
@@ -426,6 +598,11 @@ class MiraiWebsocketTTSService(WebsocketTTSService):
             detail = _error_detail(getattr(response, "body", None))
             if detail:
                 message += f": {detail}"
+            request_id = getattr(response, "headers", {}).get("x-request-id")
+            if request_id:
+                message += f" [request {request_id}]"
+            if status in _ADVICE:
+                message += f". {_ADVICE[status]}"
             category = _HANDSHAKE_CATEGORIES.get(status, ErrorCategory.CONNECTIVITY)
         else:
             message = f"Mirai TTS could not connect to {self._url}: {exc}"
@@ -469,11 +646,15 @@ class MiraiWebsocketTTSService(WebsocketTTSService):
     @traced_tts
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame | None, None]:
         """Send ``text`` for ``context_id``; its audio arrives on the receive task."""
-        if not self._is_open():
+        if not self._fallback and not self._is_open():
             await self._connect()
-            if not self._is_open():
+            if not self._fallback and not self._is_open():
                 yield ErrorFrame(error=self.last_error or "Mirai TTS: not connected")
                 return
+        if self._fallback:
+            await self._fallback_tts(text, context_id)
+            yield None
+            return
         turn = self._turns.get(context_id)
         if turn is None:
             self.last_error = None
@@ -506,6 +687,13 @@ class MiraiWebsocketTTSService(WebsocketTTSService):
         """Pipecat has sent the whole turn: ask Mirai to speak what's left."""
         context_id = context_id or self.get_active_audio_context_id()
         if not context_id:
+            return
+        if self._fallback and context_id not in self._turns:
+            rest = self._fallback_text.pop(context_id, "")
+            if rest.strip() and self.audio_context_available(context_id):
+                await self._speak_over_http(rest, context_id)
+            if self.audio_context_available(context_id):
+                await self.remove_audio_context(context_id)
             return
         turn = self._turns.get(context_id)
         if turn is None:
@@ -600,7 +788,12 @@ class MiraiWebsocketTTSService(WebsocketTTSService):
     # ---------- interruptions ----------
 
     async def _handle_interruption(self, frame: InterruptionFrame, direction: FrameDirection):
+        self._interruptions += 1  # what the HTTP fallback is speaking stops here
+        self._fallback_text.clear()
+        cut_short = list(self._streams)
         await super()._handle_interruption(frame, direction)
+        for response in cut_short:
+            await response.aclose()
         # Contexts Pipecat no longer tracks (one that timed out between
         # sentences, say) may still have text at Mirai: cancel those too.
         for turn in list(self._turns.values()):
@@ -634,6 +827,8 @@ class MiraiWebsocketTTSService(WebsocketTTSService):
     # ---------- receiving ----------
 
     async def _receive_messages(self):
+        if self._fallback:
+            await asyncio.Event().wait()  # nothing to read: the call is on HTTP now
         async for message in self._get_websocket():
             if isinstance(message, bytes):
                 await self._on_audio(message)
@@ -794,8 +989,15 @@ class MiraiWebsocketTTSService(WebsocketTTSService):
             await self._retry_later(turn, float(retry_after), code, message)
             return
         where = f" (context {turn.id})" if turn is not None else ""
+        ids = ", ".join(
+            f"{name} {value}"
+            for name, value in (("session", self.session_id), ("request", request_id))
+            if value
+        )
+        advice = f". {_ADVICE[code]}" if code in _ADVICE else ""
         await self._report(
-            f"Mirai TTS error {code}: {message}{where}", _ERROR_CATEGORIES.get(code, ErrorCategory.SERVER)
+            f"Mirai TTS error {code}: {message}{where}{f' [{ids}]' if ids else ''}{advice}",
+            _ERROR_CATEGORIES.get(code, ErrorCategory.SERVER),
         )
         # The socket stays open and Mirai goes on with the next sentence; the
         # context's flush is still answered with context.done.
@@ -882,6 +1084,14 @@ async def _close_quietly(websocket):
         await websocket.close()
     except Exception as exc:
         logger.debug(f"error closing a Mirai socket: {exc!r}")
+
+
+def _http_base(url: str) -> str:
+    """``wss://host/v1/audio/speech/stream`` -> ``https://host/v1``."""
+    for ws, http in (("wss://", "https://"), ("ws://", "http://")):
+        if url.startswith(ws):
+            url = http + url[len(ws) :]
+    return re.sub(r"/audio/speech/stream/?$", "", url.rstrip("/"))
 
 
 def _error_detail(body: Any) -> str | None:

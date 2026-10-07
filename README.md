@@ -69,7 +69,8 @@ await task.queue_frame(TTSUpdateSettingsFrame(delta=MiraiTTSService.Settings(voi
 | `warm_connection` | `True` | Open the connection to Mirai while the pipeline starts (see [Connections](#connections)) |
 | `keep_warm_secs` | `30` | Keep an idle connection open while the pipeline runs; `None` turns it off |
 | `base_url` | `https://sandbox.voice.miraiminds.co/v1` | API base URL |
-| `http_client` | own client | An `httpx.AsyncClient` you manage |
+| `shared_pool` | `True` | Share connections with every other `MiraiTTSService` in the process (see [Load tests and many agents per process](#load-tests-and-many-agents-per-process)); `False` gives each service its own |
+| `http_client` | shared client | An `httpx.AsyncClient` you manage (overrides `shared_pool`) |
 
 The service reports time-to-first-byte and character usage metrics and supports
 Pipecat tracing. Interrupting the bot closes the HTTP stream at once.
@@ -99,13 +100,15 @@ session.
 
 ### Connections
 
-All requests from one service share a kept-alive HTTPS connection, so only the
-first pays for the TCP and TLS handshake (0.4–1 s from India on a fresh
-connection, and occasionally more when a connection attempt is retried). With
-`warm_connection=True` (the default), the service:
+Requests go over kept-alive HTTPS connections, so only a new connection pays
+for the TCP and TLS handshake (0.4–1 s from India, and occasionally more when a
+connection attempt is retried). The connections are shared by every
+`MiraiTTSService` for the same `base_url` in the process, so a connection one
+call opened serves the next call too. With `warm_connection=True` (the
+default), the service:
 
-- opens that connection with a `GET /v1/models` as soon as the pipeline starts,
-  before the bot's first sentence;
+- opens a connection with a `GET /v1/models` as soon as the pipeline starts,
+  before the bot's first sentence, unless an idle one is already open;
 - repeats the request when the connection has been idle for `keep_warm_secs`
   (30 s), but only while the pipeline runs. Mirai closes connections that have
   been idle for 75 s, and this keeps one open through long pauses in a call. The
@@ -117,6 +120,11 @@ connection, and occasionally more when a connection attempt is retried). With
 
 These requests are never billed. A failed one is logged and ignored, and the
 next sentence connects on its own. `warm_connection=False` turns all three off.
+
+When many pipelines start at once, starting the warm-up with each pipeline is
+too late: the greeting is sent at the same moment and opens its own connection.
+For that, call [`prewarm()`](#load-tests-and-many-agents-per-process) when your
+server starts.
 
 ### Delivery
 
@@ -194,11 +202,84 @@ Mirai as it arrives and Mirai cuts the sentences itself. It knows the danda
 | `sample_rate`, `server_sample_rate` | pipeline rate, `"auto"` | As for `MiraiTTSService`. Each sentence's rate is read from Mirai's `audio.start` |
 | `prebuffer_secs` | `0.15` | Audio collected before a sentence starts playing |
 | `keepalive_secs` | `30` | Keep a quiet socket open; `None` turns it off |
+| `shared_pool` | `True` | Take a socket `prewarm()` opened, when one is waiting; `False` always connects |
 | `text_aggregation_mode` | sentence | `TextAggregationMode.TOKEN` sends every token as it arrives |
 
 `tts.session_id` is the socket's id (`ttsws_…`), and `tts.last_server_sample_rate`
 the rate of the latest sentence. Pipecat's `on_connected`, `on_disconnected` and
 `on_connection_error` events fire as the socket opens and closes.
+
+## Load tests and many agents per process
+
+A connection to Mirai costs a TCP and TLS handshake before the first audio byte.
+One call pays it once and reuses the connection. But when many calls start at
+the same moment (a load test that starts a dozen agents at once, or a burst of
+real calls), each one pays it on its first sentence, the greeting, because
+every pipeline opens its connection as it starts. Measured from India: 343 ms
+to first byte (p50) on a new connection against 240 ms on an open one, and
+about 800 ms at p95 when a SYN has to be retransmitted.
+
+Call `prewarm()` once when your server or worker starts, in the event loop that
+will run the pipelines, with the number of calls you expect to start together:
+
+```python
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from pipecat_mirai import prewarm
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await prewarm(connections=12)              # MiraiTTSService (HTTP)
+    # await prewarm(connections=0, websocket=12)  # MiraiWebsocketTTSService
+    yield
+
+app = FastAPI(lifespan=lifespan)
+```
+
+Nothing else changes: the services find the connections on their own.
+
+- **HTTP.** Every `MiraiTTSService` in the process (with the same `base_url`)
+  shares one connection pool. `prewarm(connections=N)` opens N connections in
+  it (one `GET /v1/models` each, never billed) and refreshes them every 45 s,
+  so Mirai's 75 s idle timeout never closes them. N calls that start together
+  each find an open connection for their greeting.
+- **WebSocket.** `prewarm(websocket=M)` opens M sockets and leaves them
+  waiting, authenticated, at `session.ready`, with an empty `session.update`
+  every 30 s against Mirai's 120 s idle timeout. A `MiraiWebsocketTTSService`
+  takes one as its pipeline starts (and sends its own voice and sample rate),
+  so the call starts without a handshake, and the pool opens a replacement in
+  the background. A socket belongs to one call and is closed when that call
+  ends, never handed to another. If no socket is waiting, the service connects
+  as it always has. Waiting sockets are never billed.
+
+One process pays the handshakes once, at start-up, and its calls reuse them
+from then on. Several worker processes each have their own pool (connections
+can't be shared between processes), so each calls `prewarm()` at start-up with
+its own share of the calls. The same goes for event loops: connections belong
+to the loop that opened them, and `prewarm()` must run in the loop that runs
+the pipelines (not in a separate `asyncio.run()` before the server starts).
+
+| `prewarm()` argument | Default | |
+|---|---|---|
+| `api_key` | `$MIRAI_API_KEY` | The key the services use; waiting sockets only go to services with this key |
+| `base_url` | `https://sandbox.voice.miraiminds.co/v1` | As given to `MiraiTTSService` |
+| `connections` | `8` | HTTP connections to keep open (0–64); `0` if you only use WebSocket |
+| `websocket` | `0` | Sockets to keep waiting for `MiraiWebsocketTTSService` |
+| `websocket_url` | `base_url` as `wss://…/audio/speech/stream` | As given to `MiraiWebsocketTTSService` |
+| `timeout` | `10` | Seconds to wait for them to open |
+
+It returns a `PrewarmResult` (`http_connections`, `websockets`, `errors`) and
+never raises on a network failure: the pools keep trying in the background,
+and a service whose pool is empty connects on its own. Call it again to change
+the numbers. `shared_connection_stats()` shows what is open, and
+`close_shared_connections()` closes it all (it also closes when the event loop
+ends). `shared_pool=False` on a service opts it out (the 0.3.0 behaviour).
+
+Measured on our production API from a server in Germany, 12 calls starting at
+the same instant ([how to run it yourself](benchmarks/burst-start/)):
+
+<!-- burst-table -->
 
 ## Realtime
 
