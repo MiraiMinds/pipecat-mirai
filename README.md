@@ -3,22 +3,21 @@
 [Mirai](https://miraiminds.co) for [Pipecat](https://github.com/pipecat-ai/pipecat)
 voice agents: natural Hindi, Hinglish and Gujarati voices.
 
-- **`MiraiTTSService`**: a Pipecat TTS service for Mirai's streaming API, about
-  100 ms to first audio. Mirai sends audio at your pipeline's rate (8 kHz for
-  phone calls), with no voice registration or sample-rate workarounds.
-- **`MiraiWebsocketTTSService`**: the same voices over one WebSocket for the
-  whole call, so no sentence waits for a connection (see
-  [WebSocket](#websocket-lowest-latency)).
+- **`MiraiTTSService`**: Mirai's voices in your Pipecat pipeline. One service,
+  defaults that hold up under load: it streams over one WebSocket per call from
+  Mirai's edge next to the speech GPUs, and finds its own way back to Mirai's
+  API (WebSocket, then HTTP) if the edge can't be reached. Audio comes at your
+  pipeline's rate (8 kHz for phone calls).
 - **`MiraiRealtimeLLMService`**: hand Mirai the whole turn. Speech recognition,
   turn detection, the model and the voice run together on Mirai's side, and
   this one service replaces your STT, LLM and TTS (see [Realtime](#realtime)).
 - **`apply_output_lead()`**: stops audio breaking up on phone calls when your
-  server is busy (see [Phone calls](#phone-calls)). Since 0.3.1 the Mirai TTS
-  services apply it to your output transport automatically; call it yourself
-  only for another TTS vendor.
+  server is busy (see [Phone calls](#phone-calls)). `MiraiTTSService` applies
+  it to your output transport for you; call it yourself only for another TTS
+  vendor.
 
 **Demo:** [a 68-second conversation in Hindi with an interruption](https://github.com/MiraiMinds/pipecat-mirai/releases/download/v0.1.0/pipecat-mirai-demo.mp4)
-(Pipecat 1.12, Sarvam STT, `MiraiTTSService`).
+(Pipecat 1.12, Sarvam STT, Mirai TTS).
 
 ## Installation
 
@@ -42,6 +41,9 @@ tts = MiraiTTSService(settings=MiraiTTSService.Settings(voice="shruti"))
 pipeline = Pipeline([transport.input(), stt, user_aggregator, llm, tts, transport.output(), assistant_aggregator])
 ```
 
+That's the whole setup. Keep the defaults: they are what we load-test in
+production (10 calls starting at once, interruptions, a busy event loop).
+
 | Voice | |
 |---|---|
 | `ashu` | male |
@@ -52,11 +54,56 @@ pipeline = Pipeline([transport.input(), stt, user_aggregator, llm, tts, transpor
 Write Hindi in Devanagari and English words in Latin script, as people actually
 type Hinglish: `आपका order कल deliver होगा।`
 
-Change the voice mid-call with Pipecat's standard settings frame:
+Change the voice mid-call with Pipecat's standard settings frame (it applies
+from the next sentence):
 
 ```python
 await task.queue_frame(TTSUpdateSettingsFrame(delta=MiraiTTSService.Settings(voice="sameer")))
 ```
+
+### What it does for you
+
+The service opens one WebSocket to Mirai when the pipeline starts and carries
+the whole call over it, so no sentence waits for a connection.
+
+- **The edge.** Each socket opens on Mirai's edge, next to the speech GPUs,
+  with your API key (in the header, never in a URL). Measured in production
+  from India, 10 calls at once: Pipecat's time to first byte p50 156 ms, p95
+  285 ms, p99 344 ms. If the edge can't be reached or isn't ready within 3 s,
+  the socket opens on Mirai's API instead and the edge is left alone for a
+  minute (doubling, up to 16). A rejected key, an empty wallet or a rate limit
+  comes back with the API's own error message.
+- **HTTP when WebSockets can't get through.** If the streaming endpoint can't be
+  reached at all (a proxy that doesn't pass WebSockets, say), the call speaks
+  over Mirai's HTTP endpoint instead and the service logs it once.
+- **Text as it comes.** By default Pipecat collects the LLM's reply a sentence
+  at a time, and each sentence goes to Mirai the moment it is complete. Mirai
+  synthesises the next sentence while the current one plays, so there is no
+  pause between them. With `text_aggregation_mode=TextAggregationMode.TOKEN`,
+  every LLM token goes as it arrives and Mirai cuts the sentences itself (it
+  knows the danda (।), "Rs.", "Dr." and numbers like 3.5).
+- **Interruptions.** The reply is cancelled on Mirai straight away, and you
+  aren't billed for the sentence that was cut off. Audio from it that is still
+  on its way is dropped, so none of it plays after the interruption.
+- **Capacity.** If Mirai is briefly at capacity and says when to try again (up
+  to 5 s), the service waits that long and sends the rest of the reply once
+  more. Otherwise the error goes up the pipeline as an `ErrorFrame`.
+- **Dropped connections.** The socket is reopened at once, and a reply the drop
+  cut short is sent again from the first sentence the caller hadn't started
+  hearing.
+- **Quiet calls.** Mirai closes a socket that has sent nothing for 120 s. After
+  `keepalive_secs` (30 s) of quiet, the service sends an empty `session.update`,
+  which changes nothing and keeps the socket open.
+- **Many calls at once.** Sockets are opened ahead of need by a pool shared by
+  every service in the process, so a call usually starts on a socket that is
+  already open (see [Load tests](#load-tests-and-many-agents-per-process)).
+- **Phone calls.** It lets Pipecat's websocket output transport run 0.4 s ahead
+  of real time, so a busy server doesn't break up the caller's audio (see
+  [Phone calls](#phone-calls)).
+- **Metrics.** Time to first byte is measured at the first audio byte of each
+  reply; usage metrics are the characters Mirai billed. Pipecat tracing works.
+
+Billing is per character, as on Mirai's HTTP endpoint.
 
 ### Parameters
 
@@ -67,158 +114,60 @@ await task.queue_frame(TTSUpdateSettingsFrame(delta=MiraiTTSService.Settings(voi
 | `voice`, `model` | | Shortcuts for the same settings |
 | `sample_rate` | pipeline `audio_out_sample_rate` | Output rate |
 | `server_sample_rate` | `"auto"` | Rate to ask Mirai for (see [Sample rate](#sample-rate)) |
-| `prebuffer_secs` | `0.15` | Audio collected before an utterance starts playing (see [Delivery](#delivery)) |
-| `warm_connection` | `True` | Open the connection to Mirai while the pipeline starts (see [Connections](#connections)) |
-| `keep_warm_secs` | `30` | Keep an idle connection open while the pipeline runs; `None` turns it off |
-| `base_url` | `https://sandbox.voice.miraiminds.co/v1` | API base URL |
-| `shared_pool` | `True` | Share connections with every other `MiraiTTSService` in the process (see [Load tests and many agents per process](#load-tests-and-many-agents-per-process)); `False` gives each service its own |
-| `http_client` | shared client | An `httpx.AsyncClient` you manage (overrides `shared_pool`) |
+| `prebuffer_secs` | `0.15` | Audio collected before a sentence starts playing (see [Delivery](#delivery)) |
+| `keepalive_secs` | `30` | Keep a quiet socket open; `None` turns it off |
+| `url` | `wss://sandbox.voice.miraiminds.co/v1/audio/speech/stream` | Mirai's streaming endpoint |
+| `base_url` | | The API base URL (`https://…/v1`), as the HTTP service took it; the streaming endpoint is derived from it |
+| `edge` | `"auto"` | Stream from Mirai's edge when it can; `False` (or `MIRAI_TTS_EDGE=off`) always uses `url` |
+| `http_fallback` | `True` | Speak over HTTP if WebSockets can't reach Mirai; `False` reports the error instead |
+| `shared_pool` | `True` | Take a socket the process's pool opened ahead of need; `False` always connects |
+| `output_lead_secs` | `0.4` | Output lead on phone transports; `None` turns it off |
+| `text_aggregation_mode` | sentence | `TextAggregationMode.TOKEN` sends every token as it arrives |
 
-The service reports time-to-first-byte and character usage metrics and supports
-Pipecat tracing. Interrupting the bot closes the HTTP stream at once.
+`tts.connected_url` shows where the call is streaming from (the edge or `url`),
+`tts.session_id` the socket's id (`ttsws_…`) and `tts.last_server_sample_rate`
+the rate of the latest sentence. Pipecat's `on_connected`, `on_disconnected` and
+`on_connection_error` events fire as the socket opens and closes.
 
 ### Sample rate
 
-The service asks Mirai for audio at your pipeline's output rate when Mirai serves
-it (8000, 16000, 22050, 24000, 44100 or 48000 Hz), so nothing is converted on your side. On a
-phone pipeline at 8 kHz that is 128 kbit/s per call instead of 768 kbit/s at
-48 kHz. Bandwidth matters here: at 48 kHz, six concurrent calls on an ordinary
-link already receive audio slower than real time, and callers hear gaps.
+The service asks Mirai for audio at your pipeline's output rate when Mirai
+serves it (8000, 16000, 24000 or 48000 Hz), so nothing is converted on your
+side. On a phone pipeline at 8 kHz that is 128 kbit/s per call instead of
+768 kbit/s at 48 kHz. Bandwidth matters here: at 48 kHz, six concurrent calls on
+an ordinary link already receive audio slower than real time, and callers hear
+gaps.
 
-The service reads the rate Mirai actually sent (`X-Sample-Rate`) and resamples
-only if it differs from the output rate, so it also works with servers that
-always send 48 kHz. `tts.last_server_sample_rate` shows the rate of the latest
-utterance.
+Each sentence says the rate Mirai actually sent, and audio is resampled only if
+it differs from the output rate.
 
 | `server_sample_rate` | Request | |
 |---|---|---|
 | `"auto"` (default) | the output rate, if Mirai serves it | Otherwise Mirai sends 48 kHz and it is resampled |
 | `8000`, `16000`, `24000`, `48000` | that rate | Resampled to the output rate if they differ |
-| `None` | no rate | Mirai's default 48 kHz, resampled (the 0.2 behaviour) |
-
-If a server answers HTTP 400 to the `sample_rate` field, the request is sent once
-more without it. If that one succeeds, the field is left out for the rest of the
-session.
-
-### Connections
-
-Requests go over kept-alive HTTPS connections, so only a new connection pays
-for the TCP and TLS handshake (0.4–1 s from India, and occasionally more when a
-connection attempt is retried). The connections are shared by every
-`MiraiTTSService` for the same `base_url` in the process, so a connection one
-call opened serves the next call too. With `warm_connection=True` (the
-default), the service:
-
-- opens a connection with a `GET /v1/models` as soon as the pipeline starts,
-  before the bot's first sentence, unless an idle one is already open;
-- repeats the request when the connection has been idle for `keep_warm_secs`
-  (30 s), but only while the pipeline runs. Mirai closes connections that have
-  been idle for 75 s, and this keeps one open through long pauses in a call. The
-  client drops idle connections after 70 s, so it never sends a request on one
-  the server is closing;
-- opens a new connection straight away when an interruption cuts a sentence off
-  mid-stream (which drops that sentence's connection), while the caller is still
-  talking.
-
-These requests are never billed. A failed one is logged and ignored, and the
-next sentence connects on its own. `warm_connection=False` turns all three off.
-
-When many pipelines start at once, starting the warm-up with each pipeline is
-too late: the greeting is sent at the same moment and opens its own connection.
-For that, call [`prewarm()`](#load-tests-and-many-agents-per-process) when your
-server starts.
+| `None` | no rate | Mirai's default 48 kHz, resampled |
 
 ### Delivery
 
 Audio is pushed downstream in 40 ms frames, whatever size the network reads
-are, and as fast as Mirai sends it. When Mirai sends audio several times faster
-than real time, the service reads the stream to the end straight away (so the
-server's slot is freed sooner) and the audio waits in Pipecat's queues, as it
-would for any TTS service. Between reads, the service itself holds less than
-one frame (or, before playback starts, the first-audio buffer).
+are, and as fast as Mirai sends it. Mirai's first chunk of a sentence is
+sometimes short (14–133 ms of audio) and followed by a pause of up to 200 ms.
+If playback started on it, the caller would hear a sliver of speech, a gap, then
+the rest. So the service collects `prebuffer_secs` (150 ms) before it pushes a
+sentence's first frame. Time to first byte is still measured at the first byte
+received. `prebuffer_secs=0` pushes audio as soon as a frame is in hand.
 
-Mirai's first chunk is sometimes short (14–133 ms of audio) and followed by a
-pause of up to 200 ms. If playback started on it, the caller would hear a sliver
-of speech, a gap, then the rest. So the service collects `prebuffer_secs`
-(150 ms) before it pushes an utterance's first frame. Time to first byte is
-still measured at the first byte received. `prebuffer_secs=0` pushes audio as
-soon as a frame is in hand.
+### Upgrading
 
-When the bot is interrupted, the service closes the utterance's HTTP stream at
-once, so Mirai stops generating it. Audio not yet pushed is dropped, and nothing
-from the interrupted utterance reaches the next one.
-
-## WebSocket (lowest latency)
-
-`MiraiTTSService` sends one HTTPS request per sentence. It keeps the connection
-alive, but whenever a request finds it gone, that sentence waits for a new TCP
-and TLS handshake (0.4–1 s from India). `MiraiWebsocketTTSService` opens one
-WebSocket to Mirai when the pipeline starts and sends the whole call over it,
-so that cost is paid once, before the bot says anything.
-
-```python
-from pipecat_mirai import MiraiWebsocketTTSService
-
-tts = MiraiWebsocketTTSService(settings=MiraiWebsocketTTSService.Settings(voice="shruti"))
-
-pipeline = Pipeline([transport.input(), stt, user_aggregator, llm, tts, transport.output(), assistant_aggregator])
-```
-
-It takes the place of `MiraiTTSService` with nothing else changed: the same
-voices and settings, audio at your pipeline's rate, 40 ms frames and the 150 ms
-first-audio buffer (here, at the start of each sentence). Billing is the same
-too: each sentence Mirai delivers is billed per character, as on the HTTP
-endpoint.
-
-**How text reaches Mirai.** By default Pipecat collects the LLM's reply a
-sentence at a time, and each sentence is sent the moment it is complete. Mirai
-speaks them in order and starts synthesising the next one while the current
-one plays, so there is no pause between sentences. With
-`text_aggregation_mode=TextAggregationMode.TOKEN`, every LLM token goes to
-Mirai as it arrives and Mirai cuts the sentences itself. It knows the danda
-(।), abbreviations like "Rs." and "Dr.", and numbers like 3.5.
-
-**What the service handles for you:**
-
-- **Interruptions.** The reply is cancelled on Mirai straight away, and you
-  aren't billed for the sentence that was cut off. Audio from it that is still
-  on its way is dropped, so none of it plays after the interruption.
-- **Capacity.** If Mirai is briefly at capacity and says when to try again (up
-  to 5 s), the service waits that long and sends the rest of the reply once
-  more. Otherwise the error goes up the pipeline as an `ErrorFrame` and Mirai
-  carries on with the next sentence.
-- **Dropped connections.** The socket is reopened at once (Pipecat's reconnect,
-  with backoff after a failed attempt). A reply the drop cut short is sent
-  again once, from the first sentence the caller hadn't started hearing.
-- **Quiet calls.** Mirai closes a socket that has sent nothing for 120 s. After
-  `keepalive_secs` (30 s) of quiet, the service sends an empty
-  `session.update`, which changes nothing and keeps the socket open.
-- **Metrics.** Time to first byte is measured at the first audio byte of each
-  reply. Usage metrics are the characters Mirai billed for each sentence.
-
-**The edge.** Mirai serves streaming speech straight from an edge next to its
-GPUs, which reaches the first audio byte in about half the time, so each socket
-opens there with your API key, exactly as on `url` (in the header, never in the
-URL). If Mirai offers no edge, or it fails or isn't ready within
-3 s, the socket opens on `url` exactly as before and the edge is left alone for
-a while; `edge=False` (or `MIRAI_TTS_EDGE=off`) turns it off.
-
-| Argument | Default | |
-|---|---|---|
-| `api_key` | `$MIRAI_API_KEY` | Sent as `Authorization: Bearer` when the socket opens |
-| `url` | `wss://sandbox.voice.miraiminds.co/v1/audio/speech/stream` | The streaming endpoint |
-| `settings`, `voice`, `model` | `voice="neha"`, `model="mira-tts"` | As for `MiraiTTSService`. A new voice applies from the next sentence |
-| `sample_rate`, `server_sample_rate` | pipeline rate, `"auto"` | As for `MiraiTTSService`. Each sentence's rate is read from Mirai's `audio.start` |
-| `prebuffer_secs` | `0.15` | Audio collected before a sentence starts playing |
-| `keepalive_secs` | `30` | Keep a quiet socket open; `None` turns it off |
-| `shared_pool` | `True` | Take a socket `prewarm()` opened, when one is waiting; `False` always connects |
-| `edge` | `"auto"` | Open sockets on Mirai's edge when it offers one, falling back to `url`; `False` always uses `url`; a `wss://` URL uses that edge |
-| `text_aggregation_mode` | sentence | `TextAggregationMode.TOKEN` sends every token as it arrives |
-
-`tts.session_id` is the socket's id (`ttsws_…`), `tts.connected_url` where it
-is connected (the edge or `url`), and `tts.last_server_sample_rate` the rate of
-the latest sentence. Pipecat's `on_connected`, `on_disconnected` and
-`on_connection_error` events fire as the socket opens and closes.
+- **From 0.4 or 0.3 with `MiraiWebsocketTTSService`:** nothing to change. It is
+  now another name for `MiraiTTSService`, the same class.
+- **From `MiraiTTSService` in 0.4 and earlier (HTTP):** nothing to change either.
+  Your code now streams over a WebSocket from the edge. `base_url`,
+  `http_client` (used for the HTTP fallback), `warm_connection` and
+  `keep_warm_secs` (now `keepalive_secs`) are still accepted.
+- **If you want HTTP only**, use `MiraiHttpTTSService`: the 0.4 HTTP service
+  under a new name, one streaming request per sentence over shared, self-warming
+  keep-alive connections, with the same arguments as before.
 
 ## Load tests and many agents per process
 
@@ -230,8 +179,11 @@ every pipeline opens its connection as it starts. Measured from India: 343 ms
 to first byte (p50) on a new connection against 240 ms on an open one, and
 about 800 ms at p95 when a SYN has to be retransmitted.
 
-Call `prewarm()` once when your server or worker starts, in the event loop that
-will run the pipelines, with the number of calls you expect to start together:
+You don't have to do anything: the first service to start sets the process's
+socket pool going, and it keeps more sockets waiting than the recent peak of
+calls. To have the very first burst after start-up find open sockets too, call
+`prewarm()` once when your server or worker starts, in the event loop that will
+run the pipelines, with the number of calls you expect to start together:
 
 ```python
 from contextlib import asynccontextmanager
@@ -241,8 +193,8 @@ from pipecat_mirai import prewarm
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await prewarm(connections=12)              # MiraiTTSService (HTTP)
-    # await prewarm(connections=0, websocket=12)  # MiraiWebsocketTTSService
+    await prewarm(websocket=12)                    # MiraiTTSService
+    # await prewarm(connections=12, websocket=0)   # MiraiHttpTTSService
     yield
 
 app = FastAPI(lifespan=lifespan)
@@ -250,14 +202,14 @@ app = FastAPI(lifespan=lifespan)
 
 Nothing else changes: the services find the connections on their own.
 
-- **HTTP.** Every `MiraiTTSService` in the process (with the same `base_url`)
+- **HTTP** (`MiraiHttpTTSService`). Every one in the process (with the same `base_url`)
   shares one connection pool. `prewarm(connections=N)` opens N connections in
   it (one `GET /v1/models` each, never billed) and refreshes them every 45 s,
   so Mirai's 75 s idle timeout never closes them. N calls that start together
   each find an open connection for their greeting.
-- **WebSocket.** `prewarm(websocket=M)` opens M sockets and leaves them
+- **WebSocket** (`MiraiTTSService`). `prewarm(websocket=M)` opens M sockets and leaves them
   waiting, authenticated, at `session.ready`, with an empty `session.update`
-  every 30 s against Mirai's 120 s idle timeout. A `MiraiWebsocketTTSService`
+  every 30 s against Mirai's 120 s idle timeout. A `MiraiTTSService`
   takes one as its pipeline starts (and sends its own voice and sample rate),
   so the call starts without a handshake, and the pool opens a replacement in
   the background. A socket belongs to one call and is closed when that call
@@ -274,11 +226,11 @@ the pipelines (not in a separate `asyncio.run()` before the server starts).
 | `prewarm()` argument | Default | |
 |---|---|---|
 | `api_key` | `$MIRAI_API_KEY` | The key the services use; waiting sockets only go to services with this key |
-| `base_url` | `https://sandbox.voice.miraiminds.co/v1` | As given to `MiraiTTSService` |
-| `connections` | `8` | HTTP connections to keep open (0–64); `0` if you only use WebSocket |
-| `websocket` | `0` | Sockets to keep waiting for `MiraiWebsocketTTSService` |
-| `websocket_url` | `base_url` as `wss://…/audio/speech/stream` | As given to `MiraiWebsocketTTSService` |
-| `edge` | `"auto"` | As given to `MiraiWebsocketTTSService`; waiting sockets open on the edge when Mirai offers one |
+| `base_url` | `https://sandbox.voice.miraiminds.co/v1` | The API base URL |
+| `connections` | `0` | HTTP connections to keep open for `MiraiHttpTTSService` (0–64) |
+| `websocket` | `8` | Sockets to keep waiting for `MiraiTTSService` (0–64) |
+| `websocket_url` | `base_url` as `wss://…/audio/speech/stream` | As given to `MiraiTTSService` as `url` |
+| `edge` | `"auto"` | As given to `MiraiTTSService`; waiting sockets open on the edge |
 | `timeout` | `10` | Seconds to wait for them to open |
 
 It returns a `PrewarmResult` (`http_connections`, `websockets`, `errors`) and
@@ -347,12 +299,11 @@ hears the voice break up. This happens with every TTS vendor, and it gets worse
 as you add concurrent calls.
 
 `apply_output_lead()` lets the transport send up to 0.4 s ahead, so short stalls
-go unnoticed. **Since 0.3.1, `MiraiTTSService` and `MiraiWebsocketTTSService`
-do this for you** when the pipeline starts (`output_lead_secs=0.4`; `None` turns
+go unnoticed. **`MiraiTTSService` (and `MiraiHttpTTSService`) do this for you** when the pipeline starts (`output_lead_secs=0.4`; `None` turns
 it off). Call it yourself only with another TTS vendor:
 
 ```python
-from pipecat_mirai import MiraiTTSService, apply_output_lead
+from pipecat_mirai import apply_output_lead
 
 transport = FastAPIWebsocketTransport(websocket, FastAPIWebsocketParams(
     audio_out_enabled=True, add_wav_header=False, serializer=serializer, ...))
@@ -374,31 +325,31 @@ Pipecat's "bot stopped speaking" event fires up to the lead earlier than the cal
 actually stops hearing the bot.
 
 **Recommended phone setup:** an 8 kHz pipeline (`audio_out_sample_rate=8000`) and
-`MiraiWebsocketTTSService(api_key=..., voice=...)` with its defaults. Nothing else
-to configure: the service applies the 0.4 s output lead to your transport, asks
-Mirai for 8 kHz audio, shares warm connections across every call in the process
-(a pool of ready sockets for the WebSocket service), and races a second TCP
-connect when one stalls. `MiraiTTSService` (HTTP) does the same with a shared,
-self-warming connection pool.
+`MiraiTTSService(api_key=..., voice=...)` with its defaults. Nothing else to
+configure: the service streams from Mirai's edge, applies the 0.4 s output lead
+to your transport, asks Mirai for 8 kHz audio, keeps a pool of ready sockets
+shared by every call in the process, and races a second TCP connect when one
+stalls.
 
 Measured on our production API with only those defaults: 10 phone calls started
 at the same instant in one Pipecat process, about 100 turns with a fifth of the
 replies interrupted, and the bot's event loop deliberately stalled 150–300 ms
-every ~2 s — no audible gaps, no errors, nothing played after an interruption,
-every sentence in order, for both `MiraiWebsocketTTSService` and
-`MiraiTTSService` ([how to run it yourself](benchmarks/customer-e2e/)).
+every ~2 s: no errors, nothing played after an interruption, every sentence in
+order, and from India a time to first audio (LLM first token to the phone) of
+p50 422 ms, p95 641 ms after the greeting
+([how to run it yourself](benchmarks/customer-e2e/)).
 
 ## Examples
 
 - [`examples/foundational/01-say-hello.py`](examples/foundational/01-say-hello.py):
   a minimal Pipecat pipeline that speaks one line and saves `hello.wav`.
 - [`examples/foundational/03-websocket-say-hello.py`](examples/foundational/03-websocket-say-hello.py):
-  stream a reply into `MiraiWebsocketTTSService` a few words at a time, as an
+  stream a reply into `MiraiTTSService` a few words at a time, as an
   LLM would, and save it.
 - [`examples/foundational/02-realtime-conversation.py`](examples/foundational/02-realtime-conversation.py):
   talk to a Realtime session from your microphone, with per-turn timing.
 - [`examples/phone/twilio_bot.py`](examples/phone/twilio_bot.py): a Twilio Media
-  Streams bot with `MiraiTTSService` and `apply_output_lead`.
+  Streams bot with `MiraiTTSService`.
 - [`examples/phone/twilio_realtime_bot.py`](examples/phone/twilio_realtime_bot.py):
   the same phone line on the Realtime API.
 

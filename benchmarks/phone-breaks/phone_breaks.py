@@ -14,7 +14,7 @@ Three processes, so that a stall in the bot cannot stall the "phone":
             Use it to run without an API key; point --tts-url at the real API
             otherwise.
   bot       A Pipecat backend: FastAPI websocket endpoint speaking the Twilio
-            Media Streams protocol, Pipeline([transport.input(), MiraiTTSService,
+            Media Streams protocol, Pipeline([transport.input(), MiraiHttpTTSService,
             transport.output()]) at 8 kHz. Each call speaks the script's lines at
             fixed offsets. --stall-every/--stall-ms block the event loop the way
             synchronous work in a real bot does. --lead applies apply_output_lead.
@@ -99,7 +99,7 @@ def bot(a):
     from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
     from pipecat.workers.runner import WorkerRunner
 
-    from pipecat_mirai import MiraiTTSService, apply_output_lead
+    from pipecat_mirai import MiraiHttpTTSService, apply_output_lead
 
     lo, hi = (float(x) for x in a.stall_ms.split(","))
     script_lines = SCRIPT
@@ -126,7 +126,7 @@ def bot(a):
             ),
         )
         apply_output_lead(transport, a.lead)
-        tts = MiraiTTSService(
+        tts = MiraiHttpTTSService(
             api_key=os.getenv("MIRAI_API_KEY", "standin"), base_url=a.tts_url, voice=a.voice
         )
         worker = PipelineWorker(

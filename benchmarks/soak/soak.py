@@ -96,7 +96,7 @@ def child(a):
             for n in range(a.calls):
                 kind = kinds[n % len(kinds)]
                 if kind == "http":
-                    tts = pipecat_mirai.MiraiTTSService(api_key="k", base_url=http_url, voice="shruti")
+                    tts = pipecat_mirai.MiraiHttpTTSService(api_key="k", base_url=http_url, voice="shruti")
                 else:
                     tts = pipecat_mirai.MiraiWebsocketTTSService(api_key="k", url=ws_url, voice="shruti")
                 frames = [TTSSpeakFrame(TEXT), SleepFrame(0.1), TTSSpeakFrame("हाँ जी।")]

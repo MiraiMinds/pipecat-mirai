@@ -10,7 +10,7 @@ from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
 
-from pipecat_mirai import MiraiTTSService, MiraiWebsocketTTSService, apply_output_lead
+from pipecat_mirai import MiraiHttpTTSService, MiraiWebsocketTTSService, apply_output_lead
 from pipecat_mirai.pacing import ensure_output_lead, find_output_transport
 
 FRAME = 0.02  # 20 ms chunks
@@ -105,7 +105,7 @@ class WebsocketLikeOutput(PassThrough):
 
 
 def http_tts(**kwargs):
-    return MiraiTTSService(api_key="k", warm_connection=False, **kwargs)
+    return MiraiHttpTTSService(api_key="k", warm_connection=False, **kwargs)
 
 
 def test_the_lead_goes_on_the_first_output_after_the_service():
@@ -164,7 +164,7 @@ def test_a_real_fastapi_websocket_output_gets_the_lead():
     assert transport.output()._mirai_output_lead_secs == 0.4
 
 
-@pytest.mark.parametrize("cls", [MiraiTTSService, MiraiWebsocketTTSService])
+@pytest.mark.parametrize("cls", [MiraiHttpTTSService, MiraiWebsocketTTSService])
 @pytest.mark.parametrize("lead", [0.4, None])
 async def test_the_services_set_the_lead_when_the_pipeline_starts(cls, lead):
     kwargs = (

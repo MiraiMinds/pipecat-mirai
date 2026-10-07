@@ -6,7 +6,7 @@
 
 """Burst start: K pipelines start at the same instant, as in a customer's load test.
 
-Each call is a Pipecat pipeline with MiraiTTSService (--tts http) or
+Each call is a Pipecat pipeline with MiraiHttpTTSService (--tts http) or
 MiraiWebsocketTTSService (--tts ws) at 8 kHz. It speaks a greeting the moment
 it has started, then --sentences more, each after a pause. The calls run in
 --procs fresh processes (K/procs each), and every process starts its calls at
@@ -79,21 +79,21 @@ def worker_main(a):
     from pipecat.workers.runner import WorkerRunner
 
     import pipecat_mirai
-    from pipecat_mirai import MiraiTTSService, MiraiWebsocketTTSService
+    from pipecat_mirai import MiraiHttpTTSService, MiraiTTSService
 
     key = os.environ["MIRAI_API_KEY"]
     ws_url = a.ws_url or a.base_url.replace("https://", "wss://").replace("http://", "ws://").rstrip("/")
     if not a.ws_url:
         ws_url += "/audio/speech/stream"
-    cls = MiraiTTSService if a.tts == "http" else MiraiWebsocketTTSService
+    cls = MiraiHttpTTSService if a.tts == "http" else MiraiTTSService
     extra = {}
     if a.variant == "baseline" and "shared_pool" in inspect.signature(cls.__init__).parameters:
         extra["shared_pool"] = False  # 0.3.0 behaviour on 0.3.1
 
     def make_tts():
         if a.tts == "http":
-            return MiraiTTSService(api_key=key, base_url=a.base_url, voice=a.voice, **extra)
-        return MiraiWebsocketTTSService(api_key=key, url=ws_url, voice=a.voice, **extra)
+            return MiraiHttpTTSService(api_key=key, base_url=a.base_url, voice=a.voice, **extra)
+        return MiraiTTSService(api_key=key, url=ws_url, voice=a.voice, **extra)
 
     class Tap(FrameProcessor):
         def __init__(self, call):

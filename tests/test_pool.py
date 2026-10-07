@@ -13,7 +13,7 @@ from test_tts import TEXT, FakeMirai, Recorder, audio_of, errors_in, speak, tone
 from websockets.protocol import State
 
 from pipecat_mirai import (
-    MiraiTTSService,
+    MiraiHttpTTSService,
     MiraiWebsocketTTSService,
     close_shared_connections,
     prewarm,
@@ -33,7 +33,7 @@ async def _no_shared_connections_left():
 
 
 def http_tts(url, **kwargs):
-    return MiraiTTSService(api_key=KEY, base_url=url, **kwargs)
+    return MiraiHttpTTSService(api_key=KEY, base_url=url, **kwargs)
 
 
 def ws_tts(url, **kwargs):
@@ -84,7 +84,7 @@ async def test_without_the_shared_pool_every_call_connects():
 async def test_a_caller_owned_client_is_used_and_left_open():
     fake = FakeMirai()
     client = fake.client()
-    tts = MiraiTTSService(api_key=KEY, http_client=client, warm_connection=False)
+    tts = MiraiHttpTTSService(api_key=KEY, http_client=client, warm_connection=False)
     await speak(tts, 8000)
     assert len(posts(fake)) == 1
     assert not client.is_closed
@@ -129,7 +129,7 @@ async def test_a_burst_bigger_than_the_pool_grows_it_for_next_time(monkeypatch):
 async def test_prewarm_opens_connections_at_once_and_pipelines_that_start_together_use_them():
     fake = FakeMirai()
     async with fake.serve() as url:
-        result = await prewarm(api_key=KEY, base_url=url + "/", connections=3)
+        result = await prewarm(api_key=KEY, base_url=url + "/", connections=3, websocket=0)
         assert (result.http_connections, result.websockets, result.errors) == (3, 0, [])
         assert fake.connections == 3
         assert max(r["t"] for r in gets(fake)) - min(r["t"] for r in gets(fake)) < 0.1  # not paced
@@ -152,7 +152,7 @@ async def test_each_connection_is_refreshed_before_mirai_would_close_it(monkeypa
     assert pool_module.HTTP_REFRESH_AFTER < pool_module.HTTP_WARM_WINDOW < 70 < 75  # Mirai: 75 s
     fake = FakeMirai()
     async with fake.serve() as url:
-        await prewarm(api_key=KEY, base_url=url, connections=3)
+        await prewarm(api_key=KEY, base_url=url, connections=3, websocket=0)
         await asyncio.sleep(1.1)
         per_connection = [sum(r["conn"] == c for r in gets(fake)) for c in (1, 2, 3)]
         await close_shared_connections()
@@ -166,7 +166,7 @@ async def test_each_connection_is_refreshed_before_mirai_would_close_it(monkeypa
 async def test_calls_spread_over_the_warm_connections():
     fake = FakeMirai()
     async with fake.serve() as url:
-        await prewarm(api_key=KEY, base_url=url, connections=3)
+        await prewarm(api_key=KEY, base_url=url, connections=3, websocket=0)
         for _ in range(3):  # one after another: each takes the connection idle longest
             await speak(http_tts(url), 8000)
     assert [r["conn"] for r in posts(fake)] == [1, 2, 3]
@@ -175,7 +175,7 @@ async def test_calls_spread_over_the_warm_connections():
 async def test_a_lost_connection_is_replaced():
     fake = FakeMirai()
     async with fake.serve() as url:
-        await prewarm(api_key=KEY, base_url=url, connections=2)
+        await prewarm(api_key=KEY, base_url=url, connections=2, websocket=0)
         shared = shared_http_client(url)
         slot = shared.transport.slots[0]
         await slot.transport.aclose()  # say the network dropped it
@@ -261,12 +261,12 @@ async def test_a_service_reopens_a_shared_client_closed_under_it():
 async def test_shared_clients_are_per_event_loop():
     fake = FakeMirai()
     async with fake.serve() as url:
-        await prewarm(api_key=KEY, base_url=url, connections=1)
+        await prewarm(api_key=KEY, base_url=url, connections=1, websocket=0)
         here = shared_http_client(url)
 
         def in_another_loop():
             async def main():
-                # What a MiraiTTSService in this loop does (Pipecat can't run
+                # What a MiraiHttpTTSService in this loop does (Pipecat can't run
                 # a pipeline outside the main thread): hold the loop's shared
                 # client, send a request, let go.
                 there = shared_http_client(url)
@@ -305,7 +305,7 @@ async def test_prewarm_reports_failures_without_raising():
     fake = FakeMirai()
     async with fake.serve() as url:
         pass  # nothing listens there any more
-    result = await prewarm(api_key=KEY, base_url=url, connections=2, timeout=1.0)
+    result = await prewarm(api_key=KEY, base_url=url, connections=2, websocket=0, timeout=1.0)
     assert result.http_connections == 0
     assert result.errors and "ConnectError" in result.errors[0]
 
@@ -491,13 +491,13 @@ from pipecat.frames.frames import TTSSpeakFrame
 from pipecat.pipeline.worker import PipelineParams
 from pipecat.tests.utils import SleepFrame, run_test
 from test_tts import FakeMirai
-from pipecat_mirai import MiraiTTSService, MiraiWebsocketTTSService
+from pipecat_mirai import MiraiHttpTTSService, MiraiWebsocketTTSService
 
 async def main():
     http, ws = FakeMirai(), FakeMiraiWS()
     async with http.serve() as http_url, ws.serve() as ws_url:
         for tts in (
-            MiraiTTSService(api_key="k", base_url=http_url),
+            MiraiHttpTTSService(api_key="k", base_url=http_url),
             MiraiWebsocketTTSService(api_key="k", url=ws_url),
         ):
             await run_test(tts, frames_to_send=[TTSSpeakFrame("नमस्ते"), SleepFrame(0.6)],

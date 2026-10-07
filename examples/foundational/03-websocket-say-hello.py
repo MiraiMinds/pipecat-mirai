@@ -16,7 +16,7 @@
 From a checkout of this repository, `uv run python examples/foundational/03-websocket-say-hello.py`
 uses the local package instead.
 
-The text goes to `MiraiWebsocketTTSService` a few words at a time, the way an
+The text goes to `MiraiTTSService` a few words at a time, the way an
 LLM's tokens arrive. Mirai cuts it into sentences and streams each one back on
 the same socket while synthesising the next. The script prints how soon the
 first audio came back and saves the reply to hello-websocket.wav. Pass
@@ -44,7 +44,7 @@ from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.services.tts_service import TextAggregationMode
 from pipecat.workers.runner import WorkerRunner
 
-from pipecat_mirai import DEFAULT_WEBSOCKET_URL, MiraiWebsocketTTSService
+from pipecat_mirai import DEFAULT_WEBSOCKET_URL, MiraiTTSService
 
 REPLY = "नमस्ते, मैं Mirai से बोल रही हूँ। आपका order कल शाम तक deliver हो जाएगा। क्या मैं आपकी कुछ और मदद कर सकती हूँ?"
 
@@ -77,9 +77,9 @@ def words(text, per_token=2):
 
 
 async def main(args):
-    tts = MiraiWebsocketTTSService(
+    tts = MiraiTTSService(
         url=args.url,
-        settings=MiraiWebsocketTTSService.Settings(voice=args.voice),
+        settings=MiraiTTSService.Settings(voice=args.voice),
         text_aggregation_mode=TextAggregationMode.TOKEN if args.tokens else None,
     )
 
