@@ -196,6 +196,13 @@ Mirai as it arrives and Mirai cuts the sentences itself. It knows the danda
 - **Metrics.** Time to first byte is measured at the first audio byte of each
   reply. Usage metrics are the characters Mirai billed for each sentence.
 
+**The edge.** Mirai serves streaming speech straight from an edge next to its
+GPUs, which reaches the first audio byte in about half the time, so each socket
+asks Mirai for a single-use token and opens on the edge with it (your API key
+never goes there). If Mirai offers no edge, or it fails or isn't ready within
+3 s, the socket opens on `url` exactly as before and the edge is left alone for
+a while; `edge=False` (or `MIRAI_TTS_EDGE=off`) turns it off.
+
 | Argument | Default | |
 |---|---|---|
 | `api_key` | `$MIRAI_API_KEY` | Sent as `Authorization: Bearer` when the socket opens |
@@ -205,10 +212,12 @@ Mirai as it arrives and Mirai cuts the sentences itself. It knows the danda
 | `prebuffer_secs` | `0.15` | Audio collected before a sentence starts playing |
 | `keepalive_secs` | `30` | Keep a quiet socket open; `None` turns it off |
 | `shared_pool` | `True` | Take a socket `prewarm()` opened, when one is waiting; `False` always connects |
+| `edge` | `"auto"` | Open sockets on Mirai's edge when it offers one, falling back to `url`; `False` always uses `url`; a `wss://` URL uses that edge |
 | `text_aggregation_mode` | sentence | `TextAggregationMode.TOKEN` sends every token as it arrives |
 
-`tts.session_id` is the socket's id (`ttsws_…`), and `tts.last_server_sample_rate`
-the rate of the latest sentence. Pipecat's `on_connected`, `on_disconnected` and
+`tts.session_id` is the socket's id (`ttsws_…`), `tts.connected_url` where it
+is connected (the edge or `url`), and `tts.last_server_sample_rate` the rate of
+the latest sentence. Pipecat's `on_connected`, `on_disconnected` and
 `on_connection_error` events fire as the socket opens and closes.
 
 ## Load tests and many agents per process
@@ -269,6 +278,7 @@ the pipelines (not in a separate `asyncio.run()` before the server starts).
 | `connections` | `8` | HTTP connections to keep open (0–64); `0` if you only use WebSocket |
 | `websocket` | `0` | Sockets to keep waiting for `MiraiWebsocketTTSService` |
 | `websocket_url` | `base_url` as `wss://…/audio/speech/stream` | As given to `MiraiWebsocketTTSService` |
+| `edge` | `"auto"` | As given to `MiraiWebsocketTTSService`; waiting sockets open on the edge when Mirai offers one |
 | `timeout` | `10` | Seconds to wait for them to open |
 
 It returns a `PrewarmResult` (`http_connections`, `websockets`, `errors`) and
