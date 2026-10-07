@@ -190,7 +190,11 @@ class EdgeRoute:
             state = self._state()
             if time.monotonic() < state.retry_at:
                 return None
-            if state.ok:
+            if state.ok or state.failures == 0:
+                # Known good, or never tried in this process: every socket tries
+                # at once. A burst of calls at start-up must not queue behind one
+                # probe (measured: 20 sockets spread over 3.3 s). Only after the
+                # edge has failed does one socket probe while the rest wait.
                 return await self._attempt(connect)
             with _lock:
                 probe = _probes.get(loop_key)

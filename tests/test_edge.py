@@ -310,12 +310,18 @@ async def test_waiting_sockets_open_on_the_edge_and_calls_take_them():
     assert_key_never_at_edge(s)
 
 
-async def test_a_burst_of_sockets_asks_a_gateway_without_an_edge_only_once():
+async def test_a_first_burst_tries_at_once_and_a_gateway_without_an_edge_is_then_remembered():
     async with stack(offer=False) as s:
         result = await prewarm(api_key=KEY, connections=0, websocket=4, websocket_url=s.url)
         assert result.websockets == 4
-    assert len(s.gateway.mints) == 1  # one socket found out; the others waited for its answer
-    assert len(s.delhi.conns) == 4 and s.edge.handshakes == []
+        # A fresh process doesn't queue a burst behind one probe: each socket asks at
+        # once (a token request is cheap), and all of them land on the gateway.
+        assert 1 <= len(s.gateway.mints) <= 4
+        assert len(s.delhi.conns) == 4 and s.edge.handshakes == []
+        # Once the answer is known, later sockets don't ask again within the backoff.
+        before = len(s.gateway.mints)
+        result = await prewarm(api_key=KEY, connections=0, websocket=2, websocket_url=s.url)
+        assert len(s.gateway.mints) == before
 
 
 async def test_waiting_gateway_sockets_move_to_the_edge_when_it_is_back():
