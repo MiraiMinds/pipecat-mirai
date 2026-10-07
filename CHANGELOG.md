@@ -4,6 +4,49 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.1] - 2026-10-07
+
+### Added
+
+- `prewarm()`: open connections to Mirai when your server starts, so calls that
+  start together don't each pay a TCP and TLS handshake on their greeting.
+  `connections=N` opens N keep-alive HTTP connections (one `GET /v1/models`
+  each) and refreshes them every 45 s, inside Mirai's 75 s idle timeout.
+  `websocket=M` keeps M authenticated sockets waiting at `session.ready`, with
+  an empty `session.update` every 30 s against the 120 s idle timeout. Returns
+  a `PrewarmResult`; network failures are logged and returned, never raised.
+- `MiraiWebsocketTTSService` takes a waiting socket when its pipeline starts
+  (sending its own voice and rate), and connects as before when none is
+  waiting. A socket serves one call and is closed when it ends; the pool opens
+  a replacement in the background. A waiting socket closed by Mirai, or near
+  Mirai's maximum session length, is replaced. `shared_pool=False` always
+  connects.
+- `shared_connection_stats()` and `close_shared_connections()`.
+- Hedged connects: a TCP connect to Mirai that hasn't completed after 300 ms
+  starts a second attempt (and a third at 1 s); the first to connect is used and
+  the rest are closed. A burst of new connections, as when many calls start at
+  once, can lose SYNs on some network paths, and each lost SYN otherwise costs a
+  1 s (then 3 s) retransmit. `MIRAI_CONNECT_HEDGE_MS` sets the delay; `0` turns
+  it off. Not used for WebSockets when an HTTP(S) proxy is configured.
+- The output lead (0.4 s) is applied automatically to the pipeline's output
+  transport when the service starts; `apply_output_lead` is no longer needed
+  (calling it as well is harmless). `output_lead_secs=None` turns it off.
+- `benchmarks/burst-start`: K pipelines starting at the same instant, in one or
+  more processes, with each call's greeting and later-sentence TTFB.
+
+### Changed
+
+- `MiraiTTSService` uses one HTTP client per `base_url` and event loop, shared
+  by every service in the process, instead of one per service. A connection
+  opened for one call serves the next, the client (and its TLS context) is
+  created once instead of per call, and up to 64 idle connections are kept.
+  It closes 70 s after the last service using it stops, unless `prewarm()`
+  keeps it. Nothing is shared between event loops. The start-of-call warm-up
+  is skipped when an idle connection is already open, so it never ties up a
+  connection the greeting needs; one keep-warm request serves every service.
+  `shared_pool=False` restores the 0.3.0 behaviour (a client per service),
+  and `http_client=` still overrides both.
+
 ## [0.3.0] - 2026-10-07
 
 ### Added
