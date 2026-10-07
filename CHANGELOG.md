@@ -4,6 +4,36 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-10-07
+
+### Added
+
+- `MiraiWebsocketTTSService` streams from Mirai's edge, next to the speech
+  GPUs, which reaches the first audio byte in about half the time of the
+  gateway. Nothing to change: each socket (at the start of a call, on a
+  reconnect, or in the pool) opens on the edge with the API key in the
+  `Authorization` header, exactly as on the gateway, so the first sentence
+  pays one connection, not two. The gateway is asked which edge it offers
+  (`edge_url` from `POST /v2/tts/stream/tokens`) in the background and its
+  answer is reused for 10 minutes; when it stops offering the edge, sockets go
+  back to the gateway. The key is never put in a URL.
+- Safe fallback: if Mirai offers no edge (or the gateway has no token route),
+  or the edge refuses, can't be reached or doesn't
+  send `session.ready` within 3 s, that socket opens on the gateway exactly as
+  before. A failure is logged once per process and keeps sockets off the edge
+  for 60 s, doubling up to 16 min, so a dead edge doesn't slow every call. An
+  edge socket that drops mid-call reconnects (edge first, then the gateway) and
+  resends the rest of the reply, as before.
+- `edge=` on `MiraiWebsocketTTSService` and `prewarm()`: `"auto"` (default),
+  `False` (the gateway only, the 0.3.1 behaviour) or a `wss://` URL to use
+  instead of the edge Mirai names. `MIRAI_TTS_EDGE=off` turns `"auto"` off for
+  the process.
+- The WebSocket pool opens its waiting sockets on the edge too, and moves
+  sockets it opened on the gateway (while the edge was unavailable) back to
+  the edge one at a time once it is reachable. `shared_connection_stats()`
+  reports `edge`, the waiting sockets on the edge, and the service's
+  `connected_url` says where its socket is.
+
 ## [0.3.1] - 2026-10-07
 
 ### Added

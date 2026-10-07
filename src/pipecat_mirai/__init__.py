@@ -18,7 +18,7 @@ from pipecat_mirai.realtime import (
 from pipecat_mirai.tts import VOICES, MiraiTTSService, MiraiTTSSettings
 from pipecat_mirai.tts_websocket import DEFAULT_WEBSOCKET_URL, MiraiWebsocketTTSService
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 __all__ = [
     "DEFAULT_LEAD_SECS",
