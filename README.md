@@ -13,7 +13,9 @@ voice agents: natural Hindi, Hinglish and Gujarati voices.
   turn detection, the model and the voice run together on Mirai's side, and
   this one service replaces your STT, LLM and TTS (see [Realtime](#realtime)).
 - **`apply_output_lead()`**: stops audio breaking up on phone calls when your
-  server is busy (see [Phone calls](#phone-calls)). This works with any TTS service.
+  server is busy (see [Phone calls](#phone-calls)). Since 0.3.1 the Mirai TTS
+  services apply it to your output transport automatically; call it yourself
+  only for another TTS vendor.
 
 **Demo:** [a 68-second conversation in Hindi with an interruption](https://github.com/MiraiMinds/pipecat-mirai/releases/download/v0.1.0/pipecat-mirai-demo.mp4)
 (Pipecat 1.12, Sarvam STT, `MiraiTTSService`).
@@ -335,7 +337,9 @@ hears the voice break up. This happens with every TTS vendor, and it gets worse
 as you add concurrent calls.
 
 `apply_output_lead()` lets the transport send up to 0.4 s ahead, so short stalls
-go unnoticed:
+go unnoticed. **Since 0.3.1, `MiraiTTSService` and `MiraiWebsocketTTSService`
+do this for you** when the pipeline starts (`output_lead_secs=0.4`; `None` turns
+it off). Call it yourself only with another TTS vendor:
 
 ```python
 from pipecat_mirai import MiraiTTSService, apply_output_lead
@@ -359,16 +363,20 @@ at most the lead (0.4 s) of already-sent audio is discarded. One side effect:
 Pipecat's "bot stopped speaking" event fires up to the lead earlier than the caller
 actually stops hearing the bot.
 
-**Recommended phone setup:** `apply_output_lead(transport)` on the transport, an
-8 kHz pipeline (`audio_out_sample_rate=8000`) and `MiraiWebsocketTTSService`
-with its default `server_sample_rate="auto"`. The lead absorbs stalls on your
-server, one socket per call removes a connection handshake per sentence, and
-8 kHz audio from Mirai keeps each call's download at a sixth of 48 kHz, so it
-keeps up even when many calls share one link. `MiraiTTSService` (HTTP) with the
-same lead and rate also works. Measured on our production API: 12 simultaneous
-calls through `MiraiWebsocketTTSService`, 194 turns with barge-ins, no audible
-gaps, no errors, every sentence in order ([how to run it
-yourself](benchmarks/customer-e2e/)).
+**Recommended phone setup:** an 8 kHz pipeline (`audio_out_sample_rate=8000`) and
+`MiraiWebsocketTTSService(api_key=..., voice=...)` with its defaults. Nothing else
+to configure: the service applies the 0.4 s output lead to your transport, asks
+Mirai for 8 kHz audio, shares warm connections across every call in the process
+(a pool of ready sockets for the WebSocket service), and races a second TCP
+connect when one stalls. `MiraiTTSService` (HTTP) does the same with a shared,
+self-warming connection pool.
+
+Measured on our production API with only those defaults: 10 phone calls started
+at the same instant in one Pipecat process, about 100 turns with a fifth of the
+replies interrupted, and the bot's event loop deliberately stalled 150–300 ms
+every ~2 s — no audible gaps, no errors, nothing played after an interruption,
+every sentence in order, for both `MiraiWebsocketTTSService` and
+`MiraiTTSService` ([how to run it yourself](benchmarks/customer-e2e/)).
 
 ## Examples
 
