@@ -10,13 +10,15 @@ All notable changes to this project are documented here. The format follows
 
 - `MiraiWebsocketTTSService` streams from Mirai's edge, next to the speech
   GPUs, which reaches the first audio byte in about half the time of the
-  gateway. Nothing to change: before each socket opens (at the start of a
-  call, on a reconnect, or in the pool), the service asks the gateway for a
-  single-use token (`POST /v2/tts/stream/tokens`, with the API key) and, when
-  the answer names an edge, opens the socket there with the token. The API key
-  never goes to the edge; a token serves one socket and is never reused.
+  gateway. Nothing to change: each socket (at the start of a call, on a
+  reconnect, or in the pool) opens on the edge with the API key in the
+  `Authorization` header, exactly as on the gateway, so the first sentence
+  pays one connection, not two. The gateway is asked which edge it offers
+  (`edge_url` from `POST /v2/tts/stream/tokens`) in the background and its
+  answer is reused for 10 minutes; when it stops offering the edge, sockets go
+  back to the gateway. The key is never put in a URL.
 - Safe fallback: if Mirai offers no edge (or the gateway has no token route),
-  the token request fails, or the edge refuses, can't be reached or doesn't
+  or the edge refuses, can't be reached or doesn't
   send `session.ready` within 3 s, that socket opens on the gateway exactly as
   before. A failure is logged once per process and keeps sockets off the edge
   for 60 s, doubling up to 16 min, so a dead edge doesn't slow every call. An

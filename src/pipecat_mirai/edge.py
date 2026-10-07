@@ -8,22 +8,24 @@
 
 Mirai serves the streaming TTS socket from an edge host beside its GPUs as
 well as through its API gateway; the edge reaches the first audio byte in
-about half the time. Before a socket opens, :class:`EdgeRoute` asks the
-gateway for a single-use token (``POST /v2/tts/stream/tokens`` with the API
-key). When the answer names an edge (``edge_url``), the socket opens there
-with the token in its ``Authorization`` header, and speaks the same protocol.
-The API key never goes to the edge, and a token is used for one socket only.
+about half the time. A socket for Mirai's own gateway opens straight on its
+edge with the API key in the ``Authorization`` header, exactly as on the
+gateway: the edge checks the key with the gateway itself, so there is no extra
+round trip before the first sentence. The gateway is still asked which edge it
+offers (``edge_url`` from ``POST /v2/tts/stream/tokens``), in the background,
+and its answer is remembered for ``EDGE_URL_TTL`` seconds: when the gateway
+stops offering the edge, sockets go back to the gateway. For any other gateway
+the answer is waited for before the first socket (sockets starting together
+share the one request).
 
 Anything that goes wrong on the way leaves the socket to the gateway, exactly
-as before: no edge offered, a gateway without the token route (404/405), a
-failed token request, an edge that refuses the connection or doesn't send
-``session.ready`` within ``EDGE_READY_TIMEOUT``. A failure also keeps sockets
-off the edge for ``EDGE_BACKOFF_SECS`` (doubling, up to
-``EDGE_MAX_BACKOFF_SECS``), so a dead edge doesn't cost every call a timeout;
-it is logged as a warning once per process. While the edge isn't known to
-work, one socket at a time tries it and the others wait for its answer, so a
-burst of sockets doesn't send a burst of token requests to a gateway that has
-no edge to offer.
+as before: no edge offered, a gateway without the token route (404/405), an
+edge that refuses the connection or doesn't send ``session.ready`` within
+``EDGE_READY_TIMEOUT``. A failure also keeps sockets off the edge for
+``EDGE_BACKOFF_SECS`` (doubling, up to ``EDGE_MAX_BACKOFF_SECS``), so a dead
+edge doesn't cost every call a timeout; it is logged as a warning once per
+process. After a failure, one socket at a time tries the edge again and the
+others wait for its answer.
 
 ``MIRAI_TTS_EDGE=off`` turns the automatic edge off for the whole process.
 """
@@ -31,7 +33,6 @@ no edge to offer.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import os
 import threading
@@ -67,12 +68,17 @@ _health: dict[tuple[str, str], _Health] = {}
 _probes: dict[tuple[str, str, int], asyncio.Future] = {}
 _warned = False
 
-# (token URL, credential, id(loop)) -> unused single-use tokens, and the batch
-# request other sockets are waiting on. A burst of sockets shares one request.
-_tokens: dict[tuple[str, str, int], list[tuple[str, str | None, float]]] = {}
-_minting: dict[tuple[str, str, int], asyncio.Future] = {}
-TOKEN_BATCH = 10  # tokens asked for per request (the gateway allows up to 20)
-TOKEN_USE_WITHIN = 45.0  # seconds; the gateway's tokens live 60 s
+# Mirai's own gateways and the edge next to their speech GPUs. A socket to one
+# of these gateways goes straight to its edge with the API key, while the
+# gateway is asked in the background whether it still offers that edge.
+KNOWN_EDGES = {
+    "sandbox.voice.miraiminds.co": "wss://tts-edge.voice.miraiminds.co/v1/audio/speech/stream",
+}
+EDGE_URL_TTL = 600.0  # seconds a gateway's answer about its edge is reused
+# token URL -> (edge URL or None, monotonic time to ask again), learned from a gateway.
+_edge_urls: dict[str, tuple[str | None, float]] = {}
+# (token URL, id(loop)) -> the question to the gateway that sockets share.
+_asking: dict[tuple[str, int], asyncio.Task] = {}
 
 
 @dataclass
@@ -96,6 +102,17 @@ class _Busy(Exception):
 
 class _Failed(Exception):
     """The edge (or the token request) didn't work."""
+
+
+class _Refused(Exception):
+    """The gateway or the edge refused this key (401/402/403/429): not the edge's fault.
+
+    The socket opens on the gateway, which gives the reason in its own words;
+    other sockets keep using the edge.
+    """
+
+
+_KEY_REFUSALS = {401, 402, 403, 429}
 
 
 @dataclass
@@ -134,9 +151,15 @@ def _host(url: str) -> str:
     return urlparse(url).netloc or url
 
 
-def _describe(exc: BaseException) -> str:
-    """What went wrong, in a few words; never anything from the request (the token)."""
+def _status(exc: BaseException) -> int | None:
+    """The HTTP status of a refused request or WebSocket handshake, if that is what failed."""
     status = getattr(getattr(exc, "response", None), "status_code", None)
+    return status if isinstance(status, int) else None
+
+
+def _describe(exc: BaseException) -> str:
+    """What went wrong, in a few words; never anything from the request (the key)."""
+    status = _status(exc)
     if status is not None:
         return f"HTTP {status}"
     if isinstance(exc, _Failed):
@@ -153,8 +176,8 @@ def _reset():
     with _lock:
         _health.clear()
         _probes.clear()
-        _tokens.clear()
-        _minting.clear()
+        _edge_urls.clear()
+        _asking.clear()
         _warned = False
 
 
@@ -227,92 +250,96 @@ class EdgeRoute:
 
     async def _attempt(self, connect: Connect) -> EdgeSocket | None:
         try:
-            token, edge_url = await self._mint()
+            url = await self._edge_url()
         except _NoEdge as exc:
             self._no_edge(str(exc))
             return None
         except _Busy as exc:
             self._busy(exc.retry_after)
             return None
+        except _Refused:
+            return None
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._failed(f"the token request failed ({_describe(exc)})")
+            self._failed(f"the gateway couldn't say which edge to use ({_describe(exc)})")
             return None
-        url = edge_url if self.mode == "auto" else self.mode
         if not url:
             self._no_edge("the gateway offered no edge")
             return None
         try:
-            websocket, ready = await self._connect(url, token, connect)
+            websocket, ready = await self._connect(url, connect)
         except asyncio.CancelledError:
             raise
         except TimeoutError:
             self._failed(f"{_host(url)} was not ready within {EDGE_READY_TIMEOUT:g} s")
             return None
         except Exception as exc:
+            if _status(exc) in _KEY_REFUSALS:
+                # The key, the wallet or a limit: the gateway says which, and the edge stays in use.
+                logger.debug(f"Mirai: the TTS edge refused this key ({_describe(exc)}); using the gateway")
+                return None
             self._failed(f"{_host(url)}: {_describe(exc)}")
             return None
         self._succeeded(url)
         return EdgeSocket(websocket, ready, url)
 
-    async def _mint(self) -> tuple[str, str | None]:
-        """A fresh single-use token and the edge it names.
+    async def _edge_url(self) -> str | None:
+        """Where this socket goes: a forced URL, the edge the gateway offers, or Mirai's known edge.
 
-        Tokens come in batches (``TOKEN_BATCH`` per request) and sockets opening at
-        the same time share one request, so a burst of calls pays one round trip
-        to the gateway, not one each. Unused tokens are dropped after
-        ``TOKEN_USE_WITHIN`` seconds; none is ever used twice.
+        The gateway's answer is reused for ``EDGE_URL_TTL`` seconds. For Mirai's
+        own gateways the socket doesn't wait for it: it goes to the known edge
+        (or the last answer) while the gateway is asked in the background.
         """
-        loop = asyncio.get_running_loop()
-        cred = hashlib.sha256(repr(sorted(self._headers.items())).encode()).hexdigest()
-        key = (self.token_url, cred, id(loop))
-        while True:
-            now = time.monotonic()
-            with _lock:
-                cache = [t for t in _tokens.get(key, []) if t[2] > now]
-                if cache:
-                    token, edge_url, _ = cache.pop(0)
-                    _tokens[key] = cache
-                    return token, edge_url
-                _tokens.pop(key, None)
-                pending = _minting.get(key)
-                mine = pending is None
-                if mine:
-                    pending = _minting[key] = loop.create_future()
-            if not mine:
-                await asyncio.shield(pending)  # raises the batch's error, if any
-                continue
-            try:
-                batch = await self._mint_batch()
-            except BaseException as exc:
-                with _lock:
-                    _minting.pop(key, None)
-                if not pending.done():
-                    pending.set_exception(exc)
-                    pending.exception()  # marked retrieved; waiters still re-raise it
-                raise
-            # The socket that asked keeps the first token itself (never back
-            # through the cache, so it can't lose it to a race or a use-by time);
-            # the rest wait for the sockets queued behind this request.
-            mine_token, mine_edge = batch[0]
-            expires = time.monotonic() + TOKEN_USE_WITHIN
-            with _lock:
-                _tokens.setdefault(key, []).extend((t, e, expires) for t, e in batch[1:])
-                _minting.pop(key, None)
-            if not pending.done():
-                pending.set_result(None)
-            return mine_token, mine_edge
+        if self.mode != "auto":
+            return self.mode
+        with _lock:
+            learned = _edge_urls.get(self.token_url)
+        if learned is not None and learned[1] > time.monotonic():
+            return learned[0]
+        known = KNOWN_EDGES.get(urlparse(self.gateway_url).hostname or "")
+        if known is None:
+            return await asyncio.shield(self._ask())
+        self._ask().add_done_callback(_consume)
+        return learned[0] if learned is not None else known
 
-    async def _mint_batch(self) -> list[tuple[str, str | None]]:
-        """One request to the gateway for up to ``TOKEN_BATCH`` tokens."""
+    def _ask(self) -> asyncio.Task:
+        """The question to the gateway about its edge; sockets asking together share it."""
+        loop = asyncio.get_running_loop()
+        key = (self.token_url, id(loop))
+        with _lock:
+            task = _asking.get(key)
+            if task is None or task.done() or task.get_loop() is not loop:
+                task = _asking[key] = loop.create_task(self._ask_gateway())
+        return task
+
+    async def _ask_gateway(self) -> str | None:
+        """Ask the gateway which edge it offers, and remember the answer.
+
+        No answer (the gateway is down, slow or refused this key) changes
+        nothing that was known, and is asked again after ``NO_EDGE_RECHECK_SECS``.
+        """
+        try:
+            edge_url = await self._request_edge_url()
+        except _NoEdge:
+            edge_url = None
+        except BaseException:
+            with _lock:
+                learned = _edge_urls.get(self.token_url)
+                if learned is not None:
+                    _edge_urls[self.token_url] = (learned[0], time.monotonic() + NO_EDGE_RECHECK_SECS)
+            raise
+        with _lock:
+            _edge_urls[self.token_url] = (edge_url, time.monotonic() + EDGE_URL_TTL)
+        return edge_url
+
+    async def _request_edge_url(self) -> str | None:
+        """One request to the gateway's token route, for the ``edge_url`` in its answer."""
         shared = shared_http_client(self._http_base)
         owner = object()
         shared.hold(owner, warm=False, headers=self._headers)
         try:
-            response = await shared.client.post(
-                self.token_url, params={"count": TOKEN_BATCH}, headers=self._headers, timeout=TOKEN_TIMEOUT
-            )
+            response = await shared.client.post(self.token_url, headers=self._headers, timeout=TOKEN_TIMEOUT)
         finally:
             shared.release(owner)
         status = response.status_code
@@ -324,6 +351,8 @@ class EdgeRoute:
             except (TypeError, ValueError):
                 retry_after = BUSY_RECHECK_SECS
             raise _Busy(retry_after)
+        if status in _KEY_REFUSALS:
+            raise _Refused(f"HTTP {status}")
         if not 200 <= status < 300:
             raise _Failed(f"HTTP {status}")
         try:
@@ -331,22 +360,20 @@ class EdgeRoute:
         except ValueError:
             raise _Failed("the answer was not JSON") from None
         if not isinstance(body, dict):
-            raise _Failed("the answer had no token")
+            raise _Failed("the answer was not an object")
         edge_url = body.get("edge_url")
-        if not (isinstance(edge_url, str) and edge_url.startswith(("ws://", "wss://"))):
-            edge_url = None
-        tokens = body.get("tokens")
-        if not (isinstance(tokens, list) and tokens and all(isinstance(t, str) and t for t in tokens)):
-            token = body.get("token")  # a gateway from before batches: one token
-            if not isinstance(token, str) or not token:
-                raise _Failed("the answer had no token")
-            tokens = [token]
-        return [(t, edge_url) for t in tokens]
+        if isinstance(edge_url, str) and edge_url.startswith(("ws://", "wss://")):
+            return edge_url
+        return None
 
-    async def _connect(self, url: str, token: str, connect: Connect) -> tuple[Any, dict]:
-        """Open ``url`` with ``token`` and wait for ``session.ready``, within the time limit."""
+    async def _connect(self, url: str, connect: Connect) -> tuple[Any, dict]:
+        """Open ``url`` with the API key and wait for ``session.ready``, within the time limit.
+
+        The edge checks the key with the gateway itself, so the client needs no
+        token request of its own: one connection, and the first sentence can go.
+        """
         websocket = None
-        headers = {"Authorization": f"Bearer {token}"}
+        headers = dict(self._headers)
 
         async def attempt() -> dict:
             nonlocal websocket
@@ -429,6 +456,12 @@ class EdgeRoute:
         if state is None:
             state = _health[self._key] = _Health()
         return state
+
+
+def _consume(task: asyncio.Task):
+    """Retrieve a background question's outcome; nobody is waiting on it."""
+    if not task.cancelled() and task.exception() is not None:
+        logger.debug(f"Mirai: couldn't ask the gateway about its TTS edge ({_describe(task.exception())})")
 
 
 async def _close_quietly(websocket):

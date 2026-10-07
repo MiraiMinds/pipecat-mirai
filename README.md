@@ -198,8 +198,8 @@ Mirai as it arrives and Mirai cuts the sentences itself. It knows the danda
 
 **The edge.** Mirai serves streaming speech straight from an edge next to its
 GPUs, which reaches the first audio byte in about half the time, so each socket
-asks Mirai for a single-use token and opens on the edge with it (your API key
-never goes there). If Mirai offers no edge, or it fails or isn't ready within
+opens there with your API key, exactly as on `url` (in the header, never in the
+URL). If Mirai offers no edge, or it fails or isn't ready within
 3 s, the socket opens on `url` exactly as before and the edge is left alone for
 a while; `edge=False` (or `MIRAI_TTS_EDGE=off`) turns it off.
 

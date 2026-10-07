@@ -2,6 +2,7 @@
 
 import asyncio
 import socket
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
@@ -69,7 +70,9 @@ async def stack(*, offer=True, edge_url=None, gateway=None, delhi=None, edge=Non
     """
     delhi_ws = FakeMiraiWS(**(delhi or {}))
     gw = FakeGateway(delhi_ws, key=KEY, **(gateway or {}))
-    edge_ws = FakeMiraiWS(auth=gw.spend, **(edge or {}))
+    edge_ws = FakeMiraiWS(
+        **{"auth": lambda headers: headers.get("Authorization") == f"Bearer {KEY}", **(edge or {})}
+    )
     async with edge_ws.serve() as real_edge_url, gw.serve() as url:
         if offer:
             gw.edge_url = edge_url or real_edge_url
@@ -96,10 +99,11 @@ def bearer(seen) -> str:
 
 
 def assert_key_never_at_edge(s: Stack):
+    """The key reaches the edge in the Authorization header only: never in the URL."""
     assert s.edge.handshakes, "nothing reached the edge"
     for handshake in s.edge.handshakes:
         assert KEY not in handshake["path"]
-        assert not any(KEY in str(value) for value in handshake["headers"].values())
+        assert bearer(handshake) == f"Bearer {KEY}"
 
 
 def spoke(fake: FakeMiraiWS) -> list[int]:
@@ -118,17 +122,17 @@ def forget_backoff():
 # --- the edge path --------------------------------------------------------------------------
 
 
-async def test_speaks_from_the_edge_with_a_fresh_token(logs):
+async def test_speaks_from_the_edge_with_the_api_key(logs):
     async with stack() as s:
         tts = ws_tts(s.url)
         down, up = await ws_call(tts)
     assert audio_of(down, 8000) == tone(0.5, 8000) and not errors_in(up)
-    # One token, asked for with the API key...
+    # This gateway isn't one of Mirai's known ones: it was asked once which edge it offers...
     (mint,) = s.gateway.mints
     assert mint["path"].split("?")[0] == "/v2/tts/stream/tokens" and bearer(mint) == f"Bearer {KEY}"
-    # ...and spent opening the socket on the edge; the gateway's socket was never opened.
+    # ...and the socket opened there with the API key; the gateway's socket was never opened.
     (conn,) = s.edge.conns
-    assert bearer(conn) == f"Bearer {mint['token']}" and s.gateway.issued == {mint["token"]: True}
+    assert bearer(conn) == f"Bearer {KEY}"
     assert s.delhi.handshakes == []
     assert_key_never_at_edge(s)
     assert conn.received[0] == {
@@ -140,19 +144,16 @@ async def test_speaks_from_the_edge_with_a_fresh_token(logs):
         "sample_rate": 8000,
     }
     assert tts.connected_url == s.edge_url and tts.session_id == "ttsws_1"
-    assert not any(mint["token"] in m for _, _, m in logs)  # the token is never logged, at any level
+    assert not any(KEY in m for _, _, m in logs)  # the key is never logged, at any level
 
 
-async def test_each_socket_gets_its_own_token_over_one_kept_alive_connection():
+async def test_the_gateway_is_asked_once_which_edge_and_every_socket_goes_there():
     async with stack() as s:
         for _ in range(3):
             _, up = await ws_call(ws_tts(s.url))
             assert not errors_in(up)
-    tokens = s.gateway.tokens
-    assert len(tokens) == 3 and len(set(tokens)) == 3
-    assert [bearer(c) for c in s.edge.conns] == [f"Bearer {t}" for t in tokens]  # each used once, in turn
-    assert all(s.gateway.issued.values())
-    assert len({m["conn"] for m in s.gateway.mints}) == 1  # the shared HTTP client kept its connection
+    assert len(s.gateway.mints) == 1  # the answer is remembered
+    assert [bearer(c) for c in s.edge.conns] == [f"Bearer {KEY}"] * 3 and s.delhi.handshakes == []
 
 
 async def test_calls_starting_together_all_reach_the_edge():
@@ -160,7 +161,7 @@ async def test_calls_starting_together_all_reach_the_edge():
         results = await asyncio.gather(*(ws_call(ws_tts(s.url)) for _ in range(4)))
     assert all(not errors_in(up) for _, up in results)
     assert len(s.edge.conns) == 4 and s.delhi.handshakes == []
-    assert len(set(s.gateway.tokens)) == 4
+    assert len(s.gateway.mints) == 1  # sockets starting together share the one question
 
 
 async def test_a_forced_edge_url_is_used_whatever_the_gateway_offers():
@@ -168,7 +169,7 @@ async def test_a_forced_edge_url_is_used_whatever_the_gateway_offers():
         tts = ws_tts(s.url, edge=s.edge_url)
         _, up = await ws_call(tts)
     assert not errors_in(up)
-    assert len(s.gateway.mints) == 1 and len(s.edge.conns) == 1 and s.delhi.handshakes == []
+    assert s.gateway.mints == [] and len(s.edge.conns) == 1 and s.delhi.handshakes == []
     assert tts.connected_url == s.edge_url
     assert_key_never_at_edge(s)
 
@@ -228,8 +229,16 @@ FAILURES = {
     "edge-refuses": ({}, {"refuse_status": 503}, "HTTP 503"),
     "edge-unreachable": ({"edge_url": "closed"}, {}, "ConnectionRefusedError"),
     "no-session-ready": ({}, {"silent": True}, "not ready within"),
-    "token-route-fails": ({"gateway": {"token_status": 503}}, {}, "token request failed (HTTP 503)"),
-    "token-route-hangs": ({"gateway": {"token_delay": 5.0}}, {}, "token request failed (ReadTimeout"),
+    "token-route-fails": (
+        {"gateway": {"token_status": 503}},
+        {},
+        "couldn't say which edge to use (HTTP 503)",
+    ),
+    "token-route-hangs": (
+        {"gateway": {"token_delay": 5.0}},
+        {},
+        "couldn't say which edge to use (ReadTimeout",
+    ),
 }
 
 
@@ -258,8 +267,7 @@ async def test_a_broken_edge_falls_back_to_the_gateway_and_is_left_alone(
         await ws_call(ws_tts(s.url))
         assert len(s.gateway.mints) == mints and len(s.edge.handshakes) == attempts
         assert len(s.delhi.conns) == 2
-    for token in s.gateway.tokens:
-        assert not any(token in m for _, _, m in logs)  # the token is never logged, at any level
+    assert not any(KEY in m for _, _, m in logs)  # the key is never logged, at any level
     if s.edge.handshakes:
         assert_key_never_at_edge(s)
 
@@ -294,7 +302,7 @@ async def test_waiting_sockets_open_on_the_edge_and_calls_take_them():
         result = await prewarm(api_key=KEY, connections=0, websocket=2, websocket_url=s.url)
         assert (result.websockets, result.errors) == (2, [])
         assert len(s.edge.conns) == 2 and s.delhi.handshakes == []
-        assert len(set(s.gateway.tokens)) == 2  # one fresh token per socket
+        assert all(bearer(c) == f"Bearer {KEY}" for c in s.edge.conns)
         (stats,) = shared_connection_stats()["websocket"]
         assert stats["ready"] == 2 and stats["edge"] == 2
 
@@ -306,7 +314,7 @@ async def test_waiting_sockets_open_on_the_edge_and_calls_take_them():
         await asyncio.sleep(0.3)
         (stats,) = shared_connection_stats()["websocket"]
         assert stats["ready"] == 2 and stats["edge"] == 2  # the replacement is on the edge too
-    assert len(s.gateway.tokens) == 3 and all(s.gateway.issued.values())
+    assert len(s.gateway.mints) == 1  # asked once which edge; every socket opened there with the key
     assert_key_never_at_edge(s)
 
 
@@ -369,8 +377,7 @@ async def test_an_edge_drop_mid_call_reconnects_to_the_edge_and_resends_the_rest
         _, up = await ws_call(ws_tts(s.url), [*llm_turn(*(x + " " for x in SENTENCES)), SleepFrame(2.0)])
     assert not errors_in(up)
     assert len(s.edge.conns) == 2 and s.delhi.handshakes == []
-    tokens = s.gateway.tokens
-    assert len(tokens) == 2 and [bearer(c) for c in s.edge.conns] == [f"Bearer {t}" for t in tokens]
+    assert [bearer(c) for c in s.edge.conns] == [f"Bearer {KEY}"] * 2
     # The sentence the caller had started hearing isn't repeated; the rest is.
     assert [x for _, _, x in s.edge.spoken] == SENTENCES[1:]
     assert_key_never_at_edge(s)
@@ -416,7 +423,7 @@ def serve():
     async def run():
         delhi = FakeMiraiWS()
         gateway = FakeGateway(delhi, key="k")
-        edge = FakeMiraiWS(auth=gateway.spend)
+        edge = FakeMiraiWS(auth=lambda headers: headers.get("Authorization") == "Bearer k")
         async with edge.serve() as edge_url, gateway.serve() as url:
             gateway.edge_url = edge_url
             mirai.update(url=url, delhi=delhi)
@@ -467,47 +474,53 @@ def test_a_process_exits_cleanly_with_edge_sockets_still_open(tmp_path):
         assert bad not in proc.stderr, proc.stderr[-2000:]
 
 
-# --- batched tokens ------------------------------------------------------------------------
+# --- Mirai's own gateway --------------------------------------------------------------------
 
 
-async def test_a_burst_shares_one_token_request_and_every_socket_is_on_the_edge():
-    async with stack(gateway={"batch": True}) as s:
-        result = await prewarm(api_key=KEY, connections=0, websocket=6, websocket_url=s.url)
-        assert result.websockets == 6
-        assert len(s.gateway.mints) == 1, "six sockets, one request to the gateway"
-        assert "count=" in s.gateway.mints[0]["path"]
-        used = [t for t, spent in s.gateway.issued.items() if spent]
-        assert len(used) == 6 and len(set(used)) == 6, "each socket spent its own token"
-        assert len(s.edge.handshakes) == 6 and s.delhi.conns == []
+@pytest.fixture
+def known_edge(monkeypatch):
+    """Make the fake gateway one of Mirai's own: its host has a known edge."""
+
+    def known(s: Stack):
+        monkeypatch.setitem(edge_module.KNOWN_EDGES, "127.0.0.1", s.edge_url)
+
+    return known
+
+
+async def test_mirais_own_gateway_goes_straight_to_its_edge_without_waiting(known_edge):
+    # The gateway takes 2 s to say which edge it offers; the call doesn't wait for it.
+    async with stack(gateway={"token_delay": 2.0}) as s:
+        known_edge(s)
+        tts = ws_tts(s.url)
+        started = time.monotonic()
+        down, up = await ws_call(tts)
+        assert time.monotonic() - started < 1.5
+        assert audio_of(down, 8000) == tone(0.5, 8000) and not errors_in(up)
+        assert tts.connected_url == s.edge_url and s.delhi.handshakes == []
+        assert [bearer(c) for c in s.edge.conns] == [f"Bearer {KEY}"]
+        # ...but it was asked, in the background, once.
+        await asyncio.sleep(2.2)
+        assert len(s.gateway.mints) == 1
     assert_key_never_at_edge(s)
 
 
-async def test_spare_tokens_serve_the_next_sockets_and_expire_unused(monkeypatch):
-    async with stack(gateway={"batch": True}) as s:
-        await prewarm(api_key=KEY, connections=0, websocket=2, websocket_url=s.url)
-        assert len(s.gateway.mints) == 1
-        await prewarm(api_key=KEY, connections=0, websocket=2, websocket_url=s.url)
-        assert len(s.gateway.mints) == 1, "the batch's spare tokens are used first"
-        # Spare tokens are never used past their use-by time: a fresh request instead.
-        monkeypatch.setattr(edge_module, "TOKEN_USE_WITHIN", 0.0)
-        edge_module._tokens.clear()
-        await prewarm(api_key=KEY, connections=0, websocket=5, websocket_url=s.url)  # one more socket
-        assert len(s.gateway.mints) >= 2, "expired spares were not used"
-        spent = [t for t, used in s.gateway.issued.items() if used]
-        assert len(spent) == len(set(spent)) == len(s.edge.handshakes), "every socket its own token, once"
+async def test_when_mirais_gateway_stops_offering_the_edge_sockets_go_back_to_it(known_edge):
+    async with stack(offer=False) as s:
+        known_edge(s)
+        _, up = await ws_call(ws_tts(s.url))  # straight to the known edge, while the gateway is asked
+        assert not errors_in(up) and len(s.edge.conns) == 1
+        await asyncio.sleep(0.2)
+        tts = ws_tts(s.url)
+        _, up = await ws_call(tts)  # the gateway said no edge: this one stays on the gateway
+        assert not errors_in(up) and tts.connected_url == s.url
+        assert len(s.edge.conns) == 1 and len(s.delhi.handshakes) >= 1
 
 
-async def test_a_failed_batch_sends_every_waiting_socket_to_the_gateway_at_once():
-    async with stack(gateway={"batch": True, "token_status": 503, "token_delay": 0.2}) as s:
-        result = await prewarm(api_key=KEY, connections=0, websocket=4, websocket_url=s.url)
-        assert result.websockets == 4
-        assert len(s.gateway.mints) == 1, "one failed request, not one per socket"
-        assert len(s.delhi.conns) == 4 and s.edge.handshakes == []
-
-
-async def test_an_old_gateway_without_batches_still_gives_each_socket_a_token():
-    async with stack() as s:  # answers `token` only, ignoring `count`
-        result = await prewarm(api_key=KEY, connections=0, websocket=3, websocket_url=s.url)
-        assert result.websockets == 3
-        assert len(s.edge.handshakes) == 3 and s.delhi.conns == []
-        assert all(s.gateway.issued.values()), "every issued token was spent once"
+async def test_a_refused_key_goes_to_the_gateway_without_putting_the_edge_off(known_edge, edge_warnings):
+    async with stack(edge={"auth": lambda headers: False}) as s:
+        known_edge(s)
+        tts = ws_tts(s.url)
+        _, up = await ws_call(tts)
+        assert tts.connected_url == s.url and len(s.delhi.handshakes) == 1
+        assert edge_warnings() == []  # a key problem is not an edge problem
+        assert edge_module._health[(edge_module.token_url(s.url), "auto")].retry_at == 0.0
