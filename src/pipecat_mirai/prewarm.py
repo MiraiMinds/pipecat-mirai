@@ -14,9 +14,10 @@ from dataclasses import dataclass, field
 
 from loguru import logger
 
+from pipecat_mirai.edge import EdgeRoute, edge_mode
 from pipecat_mirai.pool import shared_http_client, websocket_pool
 from pipecat_mirai.tts import DEFAULT_BASE_URL
-from pipecat_mirai.tts_websocket import MAX_MESSAGE_BYTES
+from pipecat_mirai.tts_websocket import MAX_MESSAGE_BYTES, _http_base
 
 
 @dataclass
@@ -42,6 +43,7 @@ async def prewarm(
     connections: int = 8,
     websocket: int = 0,
     websocket_url: str | None = None,
+    edge: bool | str = "auto",
     timeout: float = 10.0,
 ) -> PrewarmResult:
     """Open connections to Mirai now, for every pipeline this event loop runs later.
@@ -63,7 +65,8 @@ async def prewarm(
       :class:`~pipecat_mirai.MiraiWebsocketTTSService` with the same URL and
       API key takes one when its pipeline starts, and a replacement is opened
       in the background. A socket serves one pipeline and is closed when it
-      ends.
+      ends. Sockets open on Mirai's edge when it is available, as the
+      service's own do.
 
     Calling it again changes the numbers; ``0`` stops keeping that kind open.
     Network failures are logged and returned in :attr:`PrewarmResult.errors`,
@@ -78,6 +81,9 @@ async def prewarm(
         websocket_url: The streaming endpoint, as given to
             ``MiraiWebsocketTTSService``. Defaults to ``base_url`` with
             ``wss://`` and ``/audio/speech/stream``.
+        edge: As given to ``MiraiWebsocketTTSService`` (``"auto"``,
+            ``False`` or an edge URL); waiting sockets go only to services
+            with the same setting.
         timeout: Seconds to wait for the connections to open.
 
     Returns:
@@ -97,6 +103,8 @@ async def prewarm(
     if not ws_url.startswith(("ws://", "wss://")):
         raise ValueError(f"websocket_url must be a ws:// or wss:// URL; got {ws_url!r}")
     headers = {"Authorization": f"Bearer {key}"}
+    mode = edge_mode(edge)
+    route = EdgeRoute(ws_url, headers, mode, _http_base(ws_url)) if mode else None
 
     result = PrewarmResult()
 
@@ -111,7 +119,7 @@ async def prewarm(
                 result.errors.append(shared.last_error)
 
     async def ws():
-        pool = websocket_pool(ws_url, headers, MAX_MESSAGE_BYTES, create=websocket > 0)
+        pool = websocket_pool(ws_url, headers, MAX_MESSAGE_BYTES, edge=route, create=websocket > 0)
         if pool is None:
             return
         pool.set_floor(websocket)

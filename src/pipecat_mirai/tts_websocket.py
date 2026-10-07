@@ -55,6 +55,7 @@ from websockets.exceptions import InvalidHandshake
 from websockets.protocol import State
 
 from pipecat_mirai._net import websocket_connect_kwargs
+from pipecat_mirai.edge import EdgeRoute, edge_mode
 from pipecat_mirai.pacing import DEFAULT_LEAD_SECS, ensure_output_lead
 from pipecat_mirai.pool import (
     SharedHTTPClient,
@@ -189,6 +190,9 @@ class MiraiWebsocketTTSService(_HTTPSpeech, WebsocketTTSService):
     Sockets are opened ahead of need by a pool shared by every service in the
     process (see :mod:`pipecat_mirai.pool`), so a pipeline usually takes one
     that is already open and authenticated and starts without a handshake.
+    Each socket opens on Mirai's edge, next to the speech GPUs, when Mirai
+    offers one (about half the time to first byte), and on ``url`` otherwise
+    (see :mod:`pipecat_mirai.edge`).
     Text goes to Mirai as Pipecat produces it: each sentence as soon as it is
     aggregated (the default), or each LLM token with
     ``text_aggregation_mode=TextAggregationMode.TOKEN``. Mirai cuts sentences
@@ -233,6 +237,7 @@ class MiraiWebsocketTTSService(_HTTPSpeech, WebsocketTTSService):
         shared_pool: bool = True,
         output_lead_secs: float | None = DEFAULT_LEAD_SECS,
         http_fallback: bool = True,
+        edge: bool | str = "auto",
         settings: Settings | None = None,
         **kwargs,
     ):
@@ -280,6 +285,16 @@ class MiraiWebsocketTTSService(_HTTPSpeech, WebsocketTTSService):
                 /v1/audio/speech`` on the same host) instead of failing, and
                 log it once. Authentication, credit and rate-limit refusals
                 are reported, not worked around. ``False`` reports them all.
+            edge: ``"auto"`` (the default): before each socket opens, get a
+                single-use token from ``url``'s host (``POST
+                /v2/tts/stream/tokens``) and, when Mirai names an edge in the
+                answer, open the socket there with the token; the API key is
+                never sent to the edge. If there is no edge, or it fails or
+                isn't ready within 3 s, the socket opens on ``url`` as before
+                and the edge is left alone for a while (60 s, doubling).
+                ``False`` always uses ``url``. A ``wss://`` URL uses that
+                edge instead of the one Mirai names (a token is still
+                fetched). ``MIRAI_TTS_EDGE=off`` turns ``"auto"`` off.
             settings: Runtime-updatable settings; values here win over the
                 ``voice``/``model`` shortcuts.
             **kwargs: Passed through to :class:`WebsocketTTSService`, e.g.
@@ -297,6 +312,7 @@ class MiraiWebsocketTTSService(_HTTPSpeech, WebsocketTTSService):
             raise ValueError(f"keepalive_secs must be > 0 or None; got {keepalive_secs!r}")
         if not url.startswith(("ws://", "wss://")):
             raise ValueError(f"url must be a ws:// or wss:// URL; got {url!r}")
+        mode = edge_mode(edge)
 
         default_settings = self.Settings(model="mira-tts", voice="neha", language=None)
         if voice is not None:
@@ -326,6 +342,7 @@ class MiraiWebsocketTTSService(_HTTPSpeech, WebsocketTTSService):
         self._init_http_speech()
         self._http_base = _http_base(url)
         self._speech_url = self._http_base + "/audio/speech"
+        self._edge = EdgeRoute(url, self._headers, mode, self._http_base) if mode else None
         self._shared_http: SharedHTTPClient | None = None
         self._fallback: str | None = None
         self._fallback_text: dict[str, str] = {}
@@ -352,6 +369,8 @@ class MiraiWebsocketTTSService(_HTTPSpeech, WebsocketTTSService):
         self.last_server_sample_rate: int | None = None
         # The socket's session id (``ttsws_...``), from session.ready.
         self.session_id: str | None = None
+        # Where the latest socket was connected: the edge's URL, or ``url``.
+        self.connected_url: str | None = None
 
     def can_generate_metrics(self) -> bool:
         """Mirai TTS reports TTFB and usage metrics."""
@@ -388,7 +407,7 @@ class MiraiWebsocketTTSService(_HTTPSpeech, WebsocketTTSService):
         logger.debug(f"{self}: asking Mirai for {asked} PCM; output {rate} Hz")
         ensure_output_lead(self, self._output_lead_secs)
         if self._shared_pool and self._pool is None:
-            self._pool = websocket_pool(self._url, self._headers, MAX_MESSAGE_BYTES)
+            self._pool = websocket_pool(self._url, self._headers, MAX_MESSAGE_BYTES, edge=self._edge)
             self._pool.hold(self)  # the first one sets the pool going
         await self._connect()
 
@@ -545,21 +564,31 @@ class MiraiWebsocketTTSService(_HTTPSpeech, WebsocketTTSService):
                 dead, self._websocket = self._websocket, None
                 await self._abandon_turns(intentional=False)
                 await _close_quietly(dead)
-            pooled = await take_websocket(self._url, self._headers) if self._shared_pool else None
+            pooled = (
+                await take_websocket(self._url, self._headers, edge=self._edge) if self._shared_pool else None
+            )
+            on_edge = None
+            if pooled is None and self._edge is not None:
+                on_edge = await self._edge.open(self._connect_to)
             if pooled is not None:
                 # Already open and authenticated; nothing else has used it.
                 # The session.update below sets this pipeline's voice and rate.
-                logger.debug(f"{self}: using waiting socket {pooled.session_id} to {self._url}")
+                logger.debug(f"{self}: using waiting socket {pooled.session_id} to {pooled.url or self._url}")
                 self._websocket = pooled.websocket
                 self.session_id = pooled.session_id
+                self.connected_url = pooled.url or self._url
                 if pooled.idle_timeout_secs:
                     self._idle_timeout_secs = pooled.idle_timeout_secs
+            elif on_edge is not None:
+                logger.debug(f"{self}: connected to the edge {on_edge.url}")
+                self._websocket = on_edge.websocket
+                self.connected_url = on_edge.url
+                await self._on_event(on_edge.ready)  # its session id and limits
             else:
                 logger.debug(f"{self}: connecting to {self._url}")
                 extra = await asyncio.wait_for(websocket_connect_kwargs(self._url), 10.0)
-                self._websocket = await self._websocket_connect(
-                    self._url, additional_headers=self._headers, max_size=MAX_MESSAGE_BYTES, **extra
-                )
+                self._websocket = await self._connect_to(self._url, self._headers, extra)
+                self.connected_url = self._url
             self._cancelled.clear()
             self._sentence = None
             await self._send(self._session_update())
@@ -568,6 +597,11 @@ class MiraiWebsocketTTSService(_HTTPSpeech, WebsocketTTSService):
         for turn in list(self._turns.values()):
             if turn.held is not None and turn.retry_task is None:
                 await self._send_held(turn)
+
+    async def _connect_to(self, url: str, headers: dict[str, str], extra: dict[str, Any]):
+        return await self._websocket_connect(
+            url, additional_headers=headers, max_size=MAX_MESSAGE_BYTES, **extra
+        )
 
     async def _reconnect_websocket(self, attempt_number: int) -> bool:
         if self._fallback or self._is_open():

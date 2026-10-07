@@ -21,8 +21,10 @@ after a cancel arrives), ``drop_after_bytes`` (abort the first connection's TCP
 after sending that much audio), ``base64`` (send audio.chunk events instead of
 binary frames) and ``close_after`` (send session.closed and
 close the first connection that many seconds after it opens), ``refuse_status``
-(answer every handshake with that HTTP status) and ``refuse_attempts``
-(handshake attempts, counted from 1, answered 503).
+(answer every handshake with that HTTP status), ``refuse_attempts``
+(handshake attempts, counted from 1, answered 503), ``auth`` (a callable given
+each handshake's headers: False answers 401) and ``silent`` (never send
+session.ready). ``handshakes`` records every handshake's path and headers.
 """
 
 from __future__ import annotations
@@ -96,6 +98,8 @@ class FakeMiraiWS:
         refuse_status=None,
         refuse_attempts=(),
         base64=False,
+        auth=None,
+        silent=False,
     ):
         self.seconds = seconds
         self.reads = reads
@@ -114,6 +118,9 @@ class FakeMiraiWS:
         self.refuse_attempts = set(refuse_attempts)  # handshake attempts (1-based) answered 503
         self.attempts = 0
         self.base64 = base64
+        self.auth = auth
+        self.silent = silent
+        self.handshakes: list[dict] = []  # {"path", "headers"} of every handshake, refused or not
         self.conns: list[_Conn] = []
         self.spoken: list[tuple[int, str, str]] = []  # (conn, context, sentence) fully sent
         self._requests = 0
@@ -142,6 +149,10 @@ class FakeMiraiWS:
     async def serve(self):
         async def process_request(connection, request):
             self.attempts += 1
+            self.handshakes.append({"path": request.path, "headers": dict(request.headers)})
+            if self.auth is not None and not self.auth(request.headers):
+                body = json.dumps({"error": {"code": "invalid_token", "message": "unknown or used token"}})
+                return Response(401, "Unauthorized", _headers(len(body)), body.encode())
             if self.refuse_status:
                 body = json.dumps({"error": {"code": "unauthorized", "message": "invalid API key"}})
                 return Response(self.refuse_status, "Refused", _headers(len(body)), body.encode())
@@ -161,6 +172,9 @@ class FakeMiraiWS:
     async def _handler(self, ws):
         conn = _Conn(ws, len(self.conns) + 1)
         self.conns.append(conn)
+        if self.silent:
+            await ws.wait_closed()
+            return
         await self._send(
             conn,
             {

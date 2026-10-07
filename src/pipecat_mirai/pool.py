@@ -20,6 +20,9 @@ connections are already open when they start. This module keeps them open:
 - WebSocket: authenticated sockets wait at ``session.ready``;
   :class:`~pipecat_mirai.MiraiWebsocketTTSService` takes one when its
   pipeline starts instead of connecting, and the pool opens a replacement.
+  Sockets open on Mirai's edge when it is available (see
+  :mod:`pipecat_mirai.edge`), and on the gateway otherwise; a gateway socket
+  is replaced by an edge one, one at a time, once the edge is back.
 
 Both start on their own when the first service of their kind starts, and keep
 ``max(AUTO, recent peak of concurrent calls + HEADROOM)`` warm from then on.
@@ -99,7 +102,7 @@ WARM_PAUSE_SECS = 5.0
 
 _lock = threading.Lock()
 _http: dict[tuple[str, int], SharedHTTPClient] = {}
-_ws: dict[tuple[str, str, int], WebsocketPool] = {}
+_ws: dict[tuple[str, str, str | None, int], WebsocketPool] = {}
 _budgets: dict[tuple[str, int], _WarmBudget] = {}
 
 
@@ -600,6 +603,8 @@ class PooledWebsocket:
     """An open, authenticated socket that has had ``session.ready``."""
 
     websocket: Any
+    url: str = ""  # where it is connected (the edge's URL, or the gateway's)
+    edge: bool = False
     session_id: str | None = None
     idle_timeout_secs: float | None = None
     max_session_secs: float | None = None
@@ -641,19 +646,30 @@ class WebsocketPool:
     ``target()`` sockets are kept open, each waiting at ``session.ready`` with
     an empty ``session.update`` before Mirai's idle timeout. :meth:`take`
     hands one to a single pipeline for good and wakes the pool to open a
-    replacement; a socket never comes back.
+    replacement; a socket never comes back. With an ``edge`` route
+    (:class:`~pipecat_mirai.edge.EdgeRoute`) each socket opens on the edge
+    when it can, and on ``url`` (the gateway) when it can't.
     """
 
-    def __init__(self, url: str, headers: dict[str, str], loop: asyncio.AbstractEventLoop, max_size: int):
+    def __init__(
+        self,
+        url: str,
+        headers: dict[str, str],
+        loop: asyncio.AbstractEventLoop,
+        max_size: int,
+        edge: Any = None,
+    ):
         self.url = url
         self.headers = dict(headers)
         self.loop = loop
         self.max_size = max_size
+        self.edge = edge
         self.floor: int | None = None
         self.auto = False
         self.peak = _Peak()
         self.ready: list[PooledWebsocket] = []
         self.opening = 0
+        self.upgrading = 0  # opening an edge socket to replace a gateway one
         self.closed = False
         self.opened = 0  # sockets opened, over the pool's life
         self.handed_out = 0
@@ -781,32 +797,51 @@ class WebsocketPool:
         logger.debug(f"Mirai: waiting socket {pooled.session_id} closed; replacing it")
         self._drop(pooled)
 
-    async def _open_one(self):
-        """Open a socket and wait for session.ready (``opening`` was counted by the caller)."""
+    async def _connect(self, url: str, headers: dict[str, str], extra: dict[str, Any]):
+        return await websocket_connect(
+            url,
+            additional_headers=headers,
+            max_size=self.max_size,
+            open_timeout=WS_OPEN_TIMEOUT,
+            close_timeout=WS_CLOSE_TIMEOUT,
+            **extra,
+        )
+
+    async def _open_one(self, *, upgrade: bool = False):
+        """Open a socket and wait for session.ready (``opening`` was counted by the caller).
+
+        ``upgrade``: open one on the edge to replace the oldest gateway socket
+        (``upgrading`` was counted instead); if the edge can't be had, nothing.
+        """
         websocket = None
         try:
-            extra = await asyncio.wait_for(websocket_connect_kwargs(self.url), WS_OPEN_TIMEOUT)
-            websocket = await websocket_connect(
-                self.url,
-                additional_headers=self.headers,
-                max_size=self.max_size,
-                open_timeout=WS_OPEN_TIMEOUT,
-                close_timeout=WS_CLOSE_TIMEOUT,
-                **extra,
-            )
-            raw = await asyncio.wait_for(websocket.recv(), WS_OPEN_TIMEOUT)
-            event = json.loads(raw) if isinstance(raw, str) else {}
-            if not isinstance(event, dict) or event.get("type") != "session.ready":
-                detail = event.get("message") if isinstance(event, dict) else None
-                raise ConnectionError(f"expected session.ready, got {event.get('type')!r}: {detail}")
-            pooled = PooledWebsocket(websocket)
+            on_edge = await self.edge.open(self._connect) if self.edge is not None else None
+            if on_edge is not None:
+                websocket, event = on_edge.websocket, on_edge.ready
+                pooled = PooledWebsocket(websocket, url=on_edge.url, edge=True)
+            elif upgrade:
+                return
+            else:
+                extra = await asyncio.wait_for(websocket_connect_kwargs(self.url), WS_OPEN_TIMEOUT)
+                websocket = await self._connect(self.url, self.headers, extra)
+                raw = await asyncio.wait_for(websocket.recv(), WS_OPEN_TIMEOUT)
+                event = json.loads(raw) if isinstance(raw, str) else {}
+                if not isinstance(event, dict) or event.get("type") != "session.ready":
+                    detail = event.get("message") if isinstance(event, dict) else None
+                    raise ConnectionError(f"expected session.ready, got {event.get('type')!r}: {detail}")
+                pooled = PooledWebsocket(websocket, url=self.url)
             pooled.note(event)
-            if self.closed or len(self.ready) >= self.target():
+            if self.closed or (not upgrade and len(self.ready) >= self.target()):
                 await _close_quietly(websocket)
                 return
             pooled.reader = self.loop.create_task(self._read(pooled), name="mirai-ws-waiting")
             self.ready.append(pooled)
             self.opened += 1
+            if upgrade:
+                stale = next((p for p in self.ready if not p.edge), None)  # the oldest gateway socket
+                if stale is not None:
+                    self._drop(stale)
+                return
             self._failures = 0
             self.last_error = None
         except asyncio.CancelledError:
@@ -814,6 +849,11 @@ class WebsocketPool:
                 await _close_quietly(websocket)
             raise
         except Exception as exc:
+            if upgrade:
+                logger.debug(f"Mirai: could not move a waiting socket to the edge: {exc!r}")
+                if websocket is not None:
+                    await _close_quietly(websocket)
+                return
             self._failures += 1
             response = getattr(exc, "response", None)
             status = getattr(response, "status_code", None)
@@ -830,7 +870,10 @@ class WebsocketPool:
             if websocket is not None:
                 await _close_quietly(websocket)
         finally:
-            self.opening -= 1
+            if upgrade:
+                self.upgrading -= 1
+            else:
+                self.opening -= 1
             self._wake.set()
             self._changed.set()
 
@@ -862,8 +905,8 @@ class WebsocketPool:
                         next_due, pooled.last_sent + interval, pooled.opened_at + pooled.max_age_secs
                     )
                 missing = target - len(self.ready) - self.opening
+                budget = _budget(self.headers, self.loop)
                 if missing > 0:
-                    budget = _budget(self.headers, self.loop)
                     if time.monotonic() < self._retry_at:
                         next_due = min(next_due, self._retry_at)
                     else:
@@ -875,7 +918,23 @@ class WebsocketPool:
                             self.opening += 1
                             missing -= 1
                             self._spawn(self._openers, self._open_one())
-                if not target and not self.ready and not self.opening:
+                elif (
+                    self.edge is not None
+                    and not self.opening
+                    and not self.upgrading
+                    and any(not p.edge for p in self.ready)
+                ):
+                    # Sockets on the gateway while the edge may be back: try to
+                    # move one (the edge decides how often that is worth it).
+                    at = self.edge.next_try_at()
+                    if at > time.monotonic():
+                        next_due = min(next_due, at)
+                    elif budget.take():
+                        self.upgrading += 1
+                        self._spawn(self._openers, self._open_one(upgrade=True))
+                    else:
+                        next_due = min(next_due, budget.next_at())
+                if not target and not self.ready and not self.opening and not self.upgrading:
                     self._maintainer = None
                     return
                 self._wake.clear()
@@ -912,24 +971,24 @@ class WebsocketPool:
 
 
 def websocket_pool(
-    url: str, headers: dict[str, str], max_size: int, *, create: bool = True
+    url: str, headers: dict[str, str], max_size: int, *, edge: Any = None, create: bool = True
 ) -> WebsocketPool | None:
-    """The running event loop's pool for ``url`` and these credentials."""
+    """The running event loop's pool for ``url``, these credentials and this edge route."""
     loop = asyncio.get_running_loop()
-    key = (url, _credential(headers), id(loop))
+    key = (url, _credential(headers), getattr(edge, "mode", None), id(loop))
     with _lock:
         _purge()
         pool = _ws.get(key)
         if pool is None or pool.closed or pool.loop is not loop:
             if not create:
                 return None
-            pool = _ws[key] = WebsocketPool(url, headers, loop, max_size)
+            pool = _ws[key] = WebsocketPool(url, headers, loop, max_size, edge)
     return pool
 
 
-async def take_websocket(url: str, headers: dict[str, str]) -> PooledWebsocket | None:
+async def take_websocket(url: str, headers: dict[str, str], *, edge: Any = None) -> PooledWebsocket | None:
     """A waiting socket for ``url`` with these credentials, if the running loop's pool has one."""
-    pool = websocket_pool(url, headers, 0, create=False)
+    pool = websocket_pool(url, headers, 0, edge=edge, create=False)
     if pool is None:
         return None
     return await pool.take()
@@ -951,9 +1010,9 @@ def shared_connection_stats() -> dict:
     Returns ``{"http": [...], "websocket": [...]}``: per shared HTTP client its
     ``base_url``, ``warm`` (open, idle) and ``busy`` connections, the
     ``target`` it keeps warm, the ``services`` using it and the ``warmups``
-    sent so far; per WebSocket pool its ``url``, sockets ``ready`` and
-    ``opening``, ``target``, ``services``, and the sockets ``opened`` and
-    ``handed_out`` so far.
+    sent so far; per WebSocket pool its ``url``, sockets ``ready`` (of
+    which ``edge`` are on Mirai's edge) and ``opening``, ``target``,
+    ``services``, and the sockets ``opened`` and ``handed_out`` so far.
     """
     loop = asyncio.get_running_loop()
     with _lock:
@@ -976,6 +1035,7 @@ def shared_connection_stats() -> dict:
         {
             "url": p.url,
             "ready": len(p.ready),
+            "edge": sum(w.edge for w in p.ready),
             "opening": p.opening,
             "target": p.target(),
             "services": p.holders,
