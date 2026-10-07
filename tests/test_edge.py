@@ -125,7 +125,7 @@ async def test_speaks_from_the_edge_with_a_fresh_token(logs):
     assert audio_of(down, 8000) == tone(0.5, 8000) and not errors_in(up)
     # One token, asked for with the API key...
     (mint,) = s.gateway.mints
-    assert mint["path"] == "/v2/tts/stream/tokens" and bearer(mint) == f"Bearer {KEY}"
+    assert mint["path"].split("?")[0] == "/v2/tts/stream/tokens" and bearer(mint) == f"Bearer {KEY}"
     # ...and spent opening the socket on the edge; the gateway's socket was never opened.
     (conn,) = s.edge.conns
     assert bearer(conn) == f"Bearer {mint['token']}" and s.gateway.issued == {mint["token"]: True}
@@ -465,3 +465,49 @@ def test_a_process_exits_cleanly_with_edge_sockets_still_open(tmp_path):
     assert "clean exit" in proc.stdout
     for bad in ("Task was destroyed", "never awaited", "ResourceWarning", "Unclosed", "unclosed"):
         assert bad not in proc.stderr, proc.stderr[-2000:]
+
+
+# --- batched tokens ------------------------------------------------------------------------
+
+
+async def test_a_burst_shares_one_token_request_and_every_socket_is_on_the_edge():
+    async with stack(gateway={"batch": True}) as s:
+        result = await prewarm(api_key=KEY, connections=0, websocket=6, websocket_url=s.url)
+        assert result.websockets == 6
+        assert len(s.gateway.mints) == 1, "six sockets, one request to the gateway"
+        assert "count=" in s.gateway.mints[0]["path"]
+        used = [t for t, spent in s.gateway.issued.items() if spent]
+        assert len(used) == 6 and len(set(used)) == 6, "each socket spent its own token"
+        assert len(s.edge.handshakes) == 6 and s.delhi.conns == []
+    assert_key_never_at_edge(s)
+
+
+async def test_spare_tokens_serve_the_next_sockets_and_expire_unused(monkeypatch):
+    async with stack(gateway={"batch": True}) as s:
+        await prewarm(api_key=KEY, connections=0, websocket=2, websocket_url=s.url)
+        assert len(s.gateway.mints) == 1
+        await prewarm(api_key=KEY, connections=0, websocket=2, websocket_url=s.url)
+        assert len(s.gateway.mints) == 1, "the batch's spare tokens are used first"
+        # Spare tokens are never used past their use-by time: a fresh request instead.
+        monkeypatch.setattr(edge_module, "TOKEN_USE_WITHIN", 0.0)
+        edge_module._tokens.clear()
+        await prewarm(api_key=KEY, connections=0, websocket=5, websocket_url=s.url)  # one more socket
+        assert len(s.gateway.mints) >= 2, "expired spares were not used"
+        spent = [t for t, used in s.gateway.issued.items() if used]
+        assert len(spent) == len(set(spent)) == len(s.edge.handshakes), "every socket its own token, once"
+
+
+async def test_a_failed_batch_sends_every_waiting_socket_to_the_gateway_at_once():
+    async with stack(gateway={"batch": True, "token_status": 503, "token_delay": 0.2}) as s:
+        result = await prewarm(api_key=KEY, connections=0, websocket=4, websocket_url=s.url)
+        assert result.websockets == 4
+        assert len(s.gateway.mints) == 1, "one failed request, not one per socket"
+        assert len(s.delhi.conns) == 4 and s.edge.handshakes == []
+
+
+async def test_an_old_gateway_without_batches_still_gives_each_socket_a_token():
+    async with stack() as s:  # answers `token` only, ignoring `count`
+        result = await prewarm(api_key=KEY, connections=0, websocket=3, websocket_url=s.url)
+        assert result.websockets == 3
+        assert len(s.edge.handshakes) == 3 and s.delhi.conns == []
+        assert all(s.gateway.issued.values()), "every issued token was spent once"

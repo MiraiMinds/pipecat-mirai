@@ -28,7 +28,15 @@ TOKEN_PATH = "/v2/tts/stream/tokens"
 
 class FakeGateway:
     def __init__(
-        self, stream, *, key="sk_test", edge_url=None, edge_field=True, token_status=201, token_delay=0.0
+        self,
+        stream,
+        *,
+        key="sk_test",
+        edge_url=None,
+        edge_field=True,
+        token_status=201,
+        token_delay=0.0,
+        batch=False,
     ):
         self.stream = stream  # the FakeMiraiWS behind the gateway's streaming endpoint
         self.key = key
@@ -36,6 +44,7 @@ class FakeGateway:
         self.edge_field = edge_field
         self.token_status = token_status
         self.token_delay = token_delay
+        self.batch = batch  # answer `count` with a `tokens` list (gateways since the batch change)
         self.mints: list[dict] = []  # {"path", "headers", "conn", "t", "token"}
         self.issued: dict[str, bool] = {}  # token -> spent
         self.connections = 0  # TCP connections, token requests and handshakes alike
@@ -63,16 +72,25 @@ class FakeGateway:
             await asyncio.sleep(self.token_delay)
         if headers.get("authorization") != f"Bearer {self.key}":
             status, body = 401, {"error": {"code": "unauthorized", "message": "invalid API key"}}
-        elif path != TOKEN_PATH or self.token_status == 404:
+        elif path.split("?", 1)[0] != TOKEN_PATH or self.token_status == 404:
             status, body = 404, {"error": {"code": "not_found", "message": "not found"}}
         elif self.token_status not in (200, 201):
             status, body = self.token_status, {"error": {"code": "unavailable", "message": "try again"}}
         else:
-            token = f"te1.{secrets.token_urlsafe(12)}.sig"
+            count = 1
+            if self.batch and "count=" in path:
+                with contextlib.suppress(ValueError):
+                    count = max(1, min(20, int(path.split("count=", 1)[1].split("&", 1)[0])))
+            batch = [f"te1.{secrets.token_urlsafe(12)}.sig" for _ in range(count)]
+            token = batch[0]
             record["token"] = token
-            self.issued[token] = False
+            record["batch"] = batch
+            for t in batch:
+                self.issued[t] = False
             status = self.token_status
             body = {"object": "tts_stream_token", "token": token, "expires_at": int(time.time()) + 60}
+            if self.batch:
+                body["tokens"] = batch
             if self.edge_field:
                 body["edge_url"] = self.edge_url
         payload = json.dumps(body).encode()

@@ -31,6 +31,7 @@ no edge to offer.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import threading
@@ -65,6 +66,13 @@ _health: dict[tuple[str, str], _Health] = {}
 # (token URL, mode, id(loop)) -> the attempt other sockets are waiting on.
 _probes: dict[tuple[str, str, int], asyncio.Future] = {}
 _warned = False
+
+# (token URL, credential, id(loop)) -> unused single-use tokens, and the batch
+# request other sockets are waiting on. A burst of sockets shares one request.
+_tokens: dict[tuple[str, str, int], list[tuple[str, str | None, float]]] = {}
+_minting: dict[tuple[str, str, int], asyncio.Future] = {}
+TOKEN_BATCH = 10  # tokens asked for per request (the gateway allows up to 20)
+TOKEN_USE_WITHIN = 45.0  # seconds; the gateway's tokens live 60 s
 
 
 @dataclass
@@ -145,6 +153,8 @@ def _reset():
     with _lock:
         _health.clear()
         _probes.clear()
+        _tokens.clear()
+        _minting.clear()
         _warned = False
 
 
@@ -247,12 +257,62 @@ class EdgeRoute:
         return EdgeSocket(websocket, ready, url)
 
     async def _mint(self) -> tuple[str, str | None]:
-        """A fresh single-use token from the gateway, and the edge it names."""
+        """A fresh single-use token and the edge it names.
+
+        Tokens come in batches (``TOKEN_BATCH`` per request) and sockets opening at
+        the same time share one request, so a burst of calls pays one round trip
+        to the gateway, not one each. Unused tokens are dropped after
+        ``TOKEN_USE_WITHIN`` seconds; none is ever used twice.
+        """
+        loop = asyncio.get_running_loop()
+        cred = hashlib.sha256(repr(sorted(self._headers.items())).encode()).hexdigest()
+        key = (self.token_url, cred, id(loop))
+        while True:
+            now = time.monotonic()
+            with _lock:
+                cache = [t for t in _tokens.get(key, []) if t[2] > now]
+                if cache:
+                    token, edge_url, _ = cache.pop(0)
+                    _tokens[key] = cache
+                    return token, edge_url
+                _tokens.pop(key, None)
+                pending = _minting.get(key)
+                mine = pending is None
+                if mine:
+                    pending = _minting[key] = loop.create_future()
+            if not mine:
+                await asyncio.shield(pending)  # raises the batch's error, if any
+                continue
+            try:
+                batch = await self._mint_batch()
+            except BaseException as exc:
+                with _lock:
+                    _minting.pop(key, None)
+                if not pending.done():
+                    pending.set_exception(exc)
+                    pending.exception()  # marked retrieved; waiters still re-raise it
+                raise
+            # The socket that asked keeps the first token itself (never back
+            # through the cache, so it can't lose it to a race or a use-by time);
+            # the rest wait for the sockets queued behind this request.
+            mine_token, mine_edge = batch[0]
+            expires = time.monotonic() + TOKEN_USE_WITHIN
+            with _lock:
+                _tokens.setdefault(key, []).extend((t, e, expires) for t, e in batch[1:])
+                _minting.pop(key, None)
+            if not pending.done():
+                pending.set_result(None)
+            return mine_token, mine_edge
+
+    async def _mint_batch(self) -> list[tuple[str, str | None]]:
+        """One request to the gateway for up to ``TOKEN_BATCH`` tokens."""
         shared = shared_http_client(self._http_base)
         owner = object()
         shared.hold(owner, warm=False, headers=self._headers)
         try:
-            response = await shared.client.post(self.token_url, headers=self._headers, timeout=TOKEN_TIMEOUT)
+            response = await shared.client.post(
+                self.token_url, params={"count": TOKEN_BATCH}, headers=self._headers, timeout=TOKEN_TIMEOUT
+            )
         finally:
             shared.release(owner)
         status = response.status_code
@@ -270,13 +330,18 @@ class EdgeRoute:
             body = response.json()
         except ValueError:
             raise _Failed("the answer was not JSON") from None
-        token = body.get("token") if isinstance(body, dict) else None
-        if not isinstance(token, str) or not token:
+        if not isinstance(body, dict):
             raise _Failed("the answer had no token")
         edge_url = body.get("edge_url")
         if not (isinstance(edge_url, str) and edge_url.startswith(("ws://", "wss://"))):
             edge_url = None
-        return token, edge_url
+        tokens = body.get("tokens")
+        if not (isinstance(tokens, list) and tokens and all(isinstance(t, str) and t for t in tokens)):
+            token = body.get("token")  # a gateway from before batches: one token
+            if not isinstance(token, str) or not token:
+                raise _Failed("the answer had no token")
+            tokens = [token]
+        return [(t, edge_url) for t in tokens]
 
     async def _connect(self, url: str, token: str, connect: Connect) -> tuple[Any, dict]:
         """Open ``url`` with ``token`` and wait for ``session.ready``, within the time limit."""
