@@ -391,7 +391,7 @@ async def test_an_edge_that_dies_mid_call_hands_the_call_to_the_gateway(edge_war
 # --- process lifecycle ----------------------------------------------------------------------
 
 SHUTDOWN_SCRIPT = """
-import asyncio, os, sys
+import asyncio, os, sys, threading
 sys.path.insert(0, {tests!r})
 os.environ.pop("MIRAI_TTS_EDGE", None)
 os.environ["MIRAI_WARM_CONNECTIONS"] = "0"
@@ -403,20 +403,41 @@ from pipecat.pipeline.worker import PipelineParams
 from pipecat.tests.utils import SleepFrame, run_test
 from pipecat_mirai import MiraiWebsocketTTSService, shared_connection_stats
 
+# Mirai (gateway and edge) runs in a thread of its own, up until after the worker's loop has ended.
+up, stop, mirai = threading.Event(), threading.Event(), {{}}
+
+def serve():
+    async def run():
+        delhi = FakeMiraiWS()
+        gateway = FakeGateway(delhi, key="k")
+        edge = FakeMiraiWS(auth=gateway.spend)
+        async with edge.serve() as edge_url, gateway.serve() as url:
+            gateway.edge_url = edge_url
+            mirai.update(url=url, delhi=delhi)
+            up.set()
+            while not stop.is_set():
+                await asyncio.sleep(0.05)
+    asyncio.run(run())
+
+server = threading.Thread(target=serve)
+server.start()
+assert up.wait(10)
+
 async def main():
-    delhi = FakeMiraiWS()
-    gateway = FakeGateway(delhi, key="k")
-    edge = FakeMiraiWS(auth=gateway.spend)
-    async with edge.serve() as edge_url, gateway.serve() as url:
-        gateway.edge_url = edge_url
-        tts = MiraiWebsocketTTSService(api_key="k", url=url)
-        await run_test(tts, frames_to_send=[TTSSpeakFrame("नमस्ते"), SleepFrame(1.2)],
-                       pipeline_params=PipelineParams(audio_out_sample_rate=8000))
+    tts = MiraiWebsocketTTSService(api_key="k", url=mirai["url"])
+    await run_test(tts, frames_to_send=[TTSSpeakFrame("नमस्ते"), SleepFrame(0.2)],
+                   pipeline_params=PipelineParams(audio_out_sample_rate=8000))
+    for _ in range(100):
         (stats,) = shared_connection_stats()["websocket"]
-        assert stats["edge"] >= 1 and not delhi.handshakes, (stats, delhi.handshakes)
-    # The pools are still warm here; the event loop ends without closing them.
+        if stats["edge"] == 3:
+            break
+        await asyncio.sleep(0.05)
+    assert stats["edge"] == 3 and not mirai["delhi"].handshakes, stats
+    # The pools are warm, their sockets open on the edge; the event loop ends without closing them.
 
 asyncio.run(main())
+stop.set()
+server.join(10)
 print("clean exit")
 """
 
