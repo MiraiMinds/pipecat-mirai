@@ -17,8 +17,7 @@ import { CommunityMaintained } from "/snippets/community-maintained.mdx";
 `MiraiTTSService` converts text into speech using [Mirai's](https://miraiminds.co)
 streaming text-to-speech API, built for Indian languages: Hindi, Hinglish (Devanagari
 with English words in Latin script) and Gujarati. Audio streams over HTTP with about
-100 ms to first audio, and is resampled from Mirai's 48 kHz to your pipeline's output
-rate, including 8 kHz for phone calls.
+100 ms to first audio, at your pipeline's output rate, including 8 kHz for phone calls.
 
 The package also includes:
 
@@ -71,6 +70,23 @@ Before using the Mirai text-to-speech service, you need:
 
 <ParamField path="sample_rate" type="int" default="None">
   Output sample rate. Defaults to the pipeline's `audio_out_sample_rate`.
+</ParamField>
+
+<ParamField path="server_sample_rate" type="int | str | None" default="auto">
+  Rate to ask Mirai for. `"auto"` asks for the output rate when Mirai serves it (8000,
+  16000, 24000 or 48000 Hz); `None` keeps Mirai's default 48 kHz. Audio is resampled
+  only if the rate Mirai sends differs from the output rate.
+</ParamField>
+
+<ParamField path="prebuffer_secs" type="float" default="0.15">
+  Audio collected before an utterance's first frame is pushed, so a short first chunk
+  followed by a pause doesn't start playback and then stall. `0` pushes audio at once.
+</ParamField>
+
+<ParamField path="warm_connection" type="bool" default="True">
+  Open the HTTPS connection to Mirai when the pipeline starts, keep it open through
+  pauses (`keep_warm_secs`, default 30 s), and reopen it after an interruption, so
+  sentences don't wait for a TCP and TLS handshake.
 </ParamField>
 
 <ParamField path="base_url" type="str" default="https://sandbox.voice.miraiminds.co/v1">

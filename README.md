@@ -4,7 +4,7 @@
 voice agents: natural Hindi, Hinglish and Gujarati voices.
 
 - **`MiraiTTSService`**: a Pipecat TTS service for Mirai's streaming API, about
-  100 ms to first audio. Audio is resampled to your pipeline's rate (8 kHz for
+  100 ms to first audio. Mirai sends audio at your pipeline's rate (8 kHz for
   phone calls), with no voice registration or sample-rate workarounds.
 - **`MiraiRealtimeLLMService`**: hand Mirai the whole turn. Speech recognition,
   turn detection, the model and the voice run together on Mirai's side, and
@@ -60,12 +60,80 @@ await task.queue_frame(TTSUpdateSettingsFrame(delta=MiraiTTSService.Settings(voi
 | `api_key` | `$MIRAI_API_KEY` | Your Mirai API key |
 | `settings` | `voice="neha"`, `model="mira-tts"` | `MiraiTTSService.Settings(...)` |
 | `voice`, `model` | | Shortcuts for the same settings |
-| `sample_rate` | pipeline `audio_out_sample_rate` | Output rate; Mirai's 48 kHz audio is resampled to it |
+| `sample_rate` | pipeline `audio_out_sample_rate` | Output rate |
+| `server_sample_rate` | `"auto"` | Rate to ask Mirai for (see [Sample rate](#sample-rate)) |
+| `prebuffer_secs` | `0.15` | Audio collected before an utterance starts playing (see [Delivery](#delivery)) |
+| `warm_connection` | `True` | Open the connection to Mirai while the pipeline starts (see [Connections](#connections)) |
+| `keep_warm_secs` | `30` | Keep an idle connection open while the pipeline runs; `None` turns it off |
 | `base_url` | `https://sandbox.voice.miraiminds.co/v1` | API base URL |
 | `http_client` | own client | An `httpx.AsyncClient` you manage |
 
 The service reports time-to-first-byte and character usage metrics and supports
 Pipecat tracing. Interrupting the bot closes the HTTP stream at once.
+
+### Sample rate
+
+The service asks Mirai for audio at your pipeline's output rate when Mirai serves
+it (8000, 16000, 22050, 24000, 44100 or 48000 Hz), so nothing is converted on your side. On a
+phone pipeline at 8 kHz that is 128 kbit/s per call instead of 768 kbit/s at
+48 kHz. Bandwidth matters here: at 48 kHz, six concurrent calls on an ordinary
+link already receive audio slower than real time, and callers hear gaps.
+
+The service reads the rate Mirai actually sent (`X-Sample-Rate`) and resamples
+only if it differs from the output rate, so it also works with servers that
+always send 48 kHz. `tts.last_server_sample_rate` shows the rate of the latest
+utterance.
+
+| `server_sample_rate` | Request | |
+|---|---|---|
+| `"auto"` (default) | the output rate, if Mirai serves it | Otherwise Mirai sends 48 kHz and it is resampled |
+| `8000`, `16000`, `24000`, `48000` | that rate | Resampled to the output rate if they differ |
+| `None` | no rate | Mirai's default 48 kHz, resampled (the 0.2 behaviour) |
+
+If a server answers HTTP 400 to the `sample_rate` field, the request is sent once
+more without it. If that one succeeds, the field is left out for the rest of the
+session.
+
+### Connections
+
+All requests from one service share a kept-alive HTTPS connection, so only the
+first pays for the TCP and TLS handshake (0.4–1 s from India on a fresh
+connection, and occasionally more when a connection attempt is retried). With
+`warm_connection=True` (the default), the service:
+
+- opens that connection with a `GET /v1/models` as soon as the pipeline starts,
+  before the bot's first sentence;
+- repeats the request when the connection has been idle for `keep_warm_secs`
+  (30 s), but only while the pipeline runs. Mirai closes connections that have
+  been idle for 75 s, and this keeps one open through long pauses in a call. The
+  client drops idle connections after 70 s, so it never sends a request on one
+  the server is closing;
+- opens a new connection straight away when an interruption cuts a sentence off
+  mid-stream (which drops that sentence's connection), while the caller is still
+  talking.
+
+These requests are never billed. A failed one is logged and ignored, and the
+next sentence connects on its own. `warm_connection=False` turns all three off.
+
+### Delivery
+
+Audio is pushed downstream in 40 ms frames, whatever size the network reads
+are, and as fast as Mirai sends it. When Mirai sends audio several times faster
+than real time, the service reads the stream to the end straight away (so the
+server's slot is freed sooner) and the audio waits in Pipecat's queues, as it
+would for any TTS service. Between reads, the service itself holds less than
+one frame (or, before playback starts, the first-audio buffer).
+
+Mirai's first chunk is sometimes short (14–133 ms of audio) and followed by a
+pause of up to 200 ms. If playback started on it, the caller would hear a sliver
+of speech, a gap, then the rest. So the service collects `prebuffer_secs`
+(150 ms) before it pushes an utterance's first frame. Time to first byte is
+still measured at the first byte received. `prebuffer_secs=0` pushes audio as
+soon as a frame is in hand.
+
+When the bot is interrupted, the service closes the utterance's HTTP stream at
+once, so Mirai stops generating it. Audio not yet pushed is dropped, and nothing
+from the interrupted utterance reaches the next one.
 
 ## Realtime
 
@@ -144,6 +212,12 @@ When the caller interrupts, Pipecat still tells the provider to clear its queue,
 at most the lead (0.4 s) of already-sent audio is discarded. One side effect:
 Pipecat's "bot stopped speaking" event fires up to the lead earlier than the caller
 actually stops hearing the bot.
+
+**Recommended phone setup:** `apply_output_lead(transport)` on the transport, an
+8 kHz pipeline (`audio_out_sample_rate=8000`) and `MiraiTTSService` with its
+default `server_sample_rate="auto"`. The lead absorbs stalls on your server, and
+8 kHz audio from Mirai keeps each call's download at a sixth of 48 kHz, so it
+keeps up even when many calls share one link.
 
 ## Examples
 
