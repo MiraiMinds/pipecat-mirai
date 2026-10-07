@@ -279,10 +279,15 @@ Pipecat's "bot stopped speaking" event fires up to the lead earlier than the cal
 actually stops hearing the bot.
 
 **Recommended phone setup:** `apply_output_lead(transport)` on the transport, an
-8 kHz pipeline (`audio_out_sample_rate=8000`) and `MiraiTTSService` with its
-default `server_sample_rate="auto"`. The lead absorbs stalls on your server, and
+8 kHz pipeline (`audio_out_sample_rate=8000`) and `MiraiWebsocketTTSService`
+with its default `server_sample_rate="auto"`. The lead absorbs stalls on your
+server, one socket per call removes a connection handshake per sentence, and
 8 kHz audio from Mirai keeps each call's download at a sixth of 48 kHz, so it
-keeps up even when many calls share one link.
+keeps up even when many calls share one link. `MiraiTTSService` (HTTP) with the
+same lead and rate also works. Measured on our production API: 12 simultaneous
+calls through `MiraiWebsocketTTSService`, 194 turns with barge-ins, no audible
+gaps, no errors, every sentence in order ([how to run it
+yourself](benchmarks/customer-e2e/)).
 
 ## Examples
 
