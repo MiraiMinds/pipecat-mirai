@@ -6,7 +6,7 @@
 
 """Mirai text-to-speech over one WebSocket per pipeline.
 
-``MiraiWebsocketTTSService`` keeps a single socket to Mirai's
+``MiraiTTSService`` keeps a single socket to Mirai's
 ``/v1/audio/speech/stream`` open for the whole call. Text is sent as Pipecat
 produces it, Mirai cuts it into sentences, synthesises the next sentence while
 the current one streams, and sends the audio back on the same socket. Nothing
@@ -34,6 +34,7 @@ from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+import httpx
 import numpy as np
 import soxr
 from loguru import logger
@@ -75,6 +76,7 @@ from pipecat_mirai.tts import (
 )
 
 DEFAULT_WEBSOCKET_URL = "wss://sandbox.voice.miraiminds.co/v1/audio/speech/stream"
+_UNSET: Any = object()
 # A capacity error is retried once when Mirai asks for a wait no longer than
 # this. Longer than that, a caller would sit through the silence; it is
 # reported instead.
@@ -183,8 +185,15 @@ class _Sentence:
     pushed: int = 0
 
 
-class MiraiWebsocketTTSService(_HTTPSpeech, WebsocketTTSService):
-    """Stream Mirai TTS over one WebSocket for the whole pipeline.
+class MiraiTTSService(_HTTPSpeech, WebsocketTTSService):
+    """Mirai text to speech for Pipecat: one WebSocket for the whole pipeline.
+
+    This is the one service to use. It picks the fastest way to Mirai by
+    itself: Mirai's edge next to the speech GPUs, then the API's own streaming
+    endpoint, then (if WebSockets can't get through at all) HTTP. Code written
+    for the HTTP ``MiraiTTSService`` of 0.4 and earlier keeps working:
+    ``base_url``, ``http_client``, ``warm_connection`` and ``keep_warm_secs``
+    are still accepted. ``MiraiWebsocketTTSService`` is the same class.
 
     The socket opens when the pipeline starts and carries every utterance.
     Sockets are opened ahead of need by a pool shared by every service in the
@@ -200,7 +209,7 @@ class MiraiWebsocketTTSService(_HTTPSpeech, WebsocketTTSService):
     so there is no gap and no handshake between sentences.
 
     Audio is asked for at the pipeline's output rate and pushed in 40 ms
-    frames after a short first-audio buffer, like :class:`MiraiTTSService`.
+    frames after a short first-audio buffer.
     An interruption cancels the reply on the server at once and drops
     whatever of it is still arriving. A dropped connection is reopened, and
     a reply it cut short is resent once. If the streaming endpoint can't be
@@ -211,9 +220,9 @@ class MiraiWebsocketTTSService(_HTTPSpeech, WebsocketTTSService):
 
     Example::
 
-        tts = MiraiWebsocketTTSService(
+        tts = MiraiTTSService(
             api_key=os.getenv("MIRAI_API_KEY"),
-            settings=MiraiWebsocketTTSService.Settings(voice="shruti"),
+            settings=MiraiTTSService.Settings(voice="shruti"),
         )
 
     Event handlers (from Pipecat): ``on_connected``, ``on_disconnected``,
@@ -227,7 +236,8 @@ class MiraiWebsocketTTSService(_HTTPSpeech, WebsocketTTSService):
         self,
         *,
         api_key: str | None = None,
-        url: str = DEFAULT_WEBSOCKET_URL,
+        url: str | None = None,
+        base_url: str | None = None,
         voice: str | None = None,
         model: str | None = None,
         sample_rate: int | None = None,
@@ -239,15 +249,22 @@ class MiraiWebsocketTTSService(_HTTPSpeech, WebsocketTTSService):
         http_fallback: bool = True,
         edge: bool | str = "auto",
         settings: Settings | None = None,
+        http_client: httpx.AsyncClient | None = None,
+        warm_connection: bool = True,
+        keep_warm_secs: float | None | object = _UNSET,
         **kwargs,
     ):
-        """Initialize the Mirai WebSocket TTS service.
+        """Initialize the Mirai TTS service.
 
         Args:
             api_key: Mirai API key. Defaults to the ``MIRAI_API_KEY`` (or
                 ``MIRA_API_KEY``) environment variable. Sent as an
                 ``Authorization: Bearer`` header.
             url: The streaming endpoint, ``wss://<host>/v1/audio/speech/stream``.
+                Defaults to Mirai's (or to ``base_url``'s, when that is given).
+            base_url: The API base URL including ``/v1``, as the HTTP service
+                took it (``https://<host>/v1``); the streaming endpoint is
+                derived from it. ``url`` wins if both are given.
             voice: Shortcut for ``settings.voice``. Defaults to ``"neha"``.
             model: Shortcut for ``settings.model``. Defaults to ``"mira-tts"``.
             sample_rate: Output sample rate. Defaults to the pipeline's
@@ -285,29 +302,35 @@ class MiraiWebsocketTTSService(_HTTPSpeech, WebsocketTTSService):
                 /v1/audio/speech`` on the same host) instead of failing, and
                 log it once. Authentication, credit and rate-limit refusals
                 are reported, not worked around. ``False`` reports them all.
-            edge: ``"auto"`` (the default): before each socket opens, get a
-                single-use token from ``url``'s host (``POST
-                /v2/tts/stream/tokens``) and, when Mirai names an edge in the
-                answer, open the socket there with the token; the API key is
-                never sent to the edge. If there is no edge, or it fails or
-                isn't ready within 3 s, the socket opens on ``url`` as before
-                and the edge is left alone for a while (60 s, doubling).
-                ``False`` always uses ``url``. A ``wss://`` URL uses that
-                edge instead of the one Mirai names (a token is still
-                fetched). ``MIRAI_TTS_EDGE=off`` turns ``"auto"`` off.
+            edge: ``"auto"`` (the default): open each socket on Mirai's edge,
+                next to the speech GPUs, with the API key (in the header,
+                never in a URL). If the edge can't be reached or isn't ready
+                within 3 s, the socket opens on ``url`` as before and the edge
+                is left alone for a while (60 s, doubling). ``False`` always
+                uses ``url``. A ``wss://`` URL uses that edge instead.
+                ``MIRAI_TTS_EDGE=off`` turns ``"auto"`` off.
             settings: Runtime-updatable settings; values here win over the
                 ``voice``/``model`` shortcuts.
+            http_client: An ``httpx.AsyncClient`` for the HTTP fallback, if
+                you manage your own; by default the process's shared one.
+            warm_connection: Accepted for code written for the HTTP service;
+                the socket always opens while the pipeline starts.
+            keep_warm_secs: The HTTP service's name for ``keepalive_secs``.
             **kwargs: Passed through to :class:`WebsocketTTSService`, e.g.
                 ``text_aggregation_mode`` or ``reconnect_on_error``.
         """
         key = api_key or os.getenv("MIRAI_API_KEY") or os.getenv("MIRA_API_KEY")
         if not key:
-            raise ValueError("Set MIRAI_API_KEY or pass api_key to MiraiWebsocketTTSService.")
+            raise ValueError("Set MIRAI_API_KEY or pass api_key to MiraiTTSService.")
         _check_server_rate(server_sample_rate)
         if output_lead_secs is not None and not output_lead_secs >= 0:
             raise ValueError(f"output_lead_secs must be >= 0 or None; got {output_lead_secs!r}")
         if not prebuffer_secs >= 0:
             raise ValueError(f"prebuffer_secs must be >= 0; got {prebuffer_secs!r}")
+        if keep_warm_secs is not _UNSET:
+            keepalive_secs = keep_warm_secs  # type: ignore[assignment]
+        if url is None:
+            url = _stream_url(base_url) if base_url else DEFAULT_WEBSOCKET_URL
         if keepalive_secs is not None and not keepalive_secs > 0:
             raise ValueError(f"keepalive_secs must be > 0 or None; got {keepalive_secs!r}")
         if not url.startswith(("ws://", "wss://")):
@@ -337,6 +360,7 @@ class MiraiWebsocketTTSService(_HTTPSpeech, WebsocketTTSService):
         self._shared_pool = shared_pool
         self._output_lead_secs = output_lead_secs
         self._http_fallback = http_fallback
+        self._own_http_client = http_client
         self._pool: WebsocketPool | None = None
         # The HTTP fallback: the same host's speech endpoint, and why it is in use (None: it isn't).
         self._init_http_speech()
@@ -520,6 +544,8 @@ class MiraiWebsocketTTSService(_HTTPSpeech, WebsocketTTSService):
             logger.warning(message)
 
     def _client(self):
+        if self._own_http_client is not None:
+            return self._own_http_client
         if self._shared_http is None or self._shared_http.closed:
             if self._shared_http is not None:
                 self._shared_http.release(self)
@@ -1137,3 +1163,16 @@ def _error_detail(body: Any) -> str | None:
     except (TypeError, ValueError, AttributeError):
         return None
     return detail[:500] if isinstance(detail, str) else None
+
+
+def _stream_url(base: str) -> str:
+    """``https://host/v1`` -> ``wss://host/v1/audio/speech/stream``."""
+    base = base.rstrip("/")
+    for http, ws in (("https://", "wss://"), ("http://", "ws://")):
+        if base.startswith(http):
+            return ws + base[len(http) :] + "/audio/speech/stream"
+    return base + "/audio/speech/stream"
+
+
+# The name this service had in 0.3 and 0.4; the same class.
+MiraiWebsocketTTSService = MiraiTTSService

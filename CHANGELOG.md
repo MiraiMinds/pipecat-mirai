@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-10-07
+
+### Changed
+
+- **One service.** `MiraiTTSService` is now the WebSocket service: it streams
+  each call over one socket from Mirai's edge, falls back to Mirai's API
+  (WebSocket, then HTTP) on its own, and keeps a pool of ready sockets. Code
+  written for the HTTP `MiraiTTSService` keeps working unchanged: `base_url`
+  (the streaming endpoint is derived from it), `http_client` (used for the HTTP
+  fallback), `warm_connection` and `keep_warm_secs` (now `keepalive_secs`) are
+  still accepted.
+- `MiraiWebsocketTTSService` is another name for `MiraiTTSService`, the same
+  class.
+- The HTTP service is now `MiraiHttpTTSService`, for anyone who wants HTTP
+  only. It is unchanged apart from the name.
+- `prewarm()` defaults to `websocket=8, connections=0`, matching the service
+  most bots use.
+
 ## [0.4.0] - 2026-10-07
 
 ### Added

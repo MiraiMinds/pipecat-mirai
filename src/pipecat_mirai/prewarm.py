@@ -40,8 +40,8 @@ async def prewarm(
     *,
     api_key: str | None = None,
     base_url: str = DEFAULT_BASE_URL,
-    connections: int = 8,
-    websocket: int = 0,
+    connections: int = 0,
+    websocket: int = 8,
     websocket_url: str | None = None,
     edge: bool | str = "auto",
     timeout: float = 10.0,
@@ -56,13 +56,13 @@ async def prewarm(
 
     - ``connections`` HTTP keep-alive connections are opened (one
       authenticated ``GET /v1/models`` each, never billed) in the client every
-      :class:`~pipecat_mirai.MiraiTTSService` for ``base_url`` in this loop
+      :class:`~pipecat_mirai.MiraiHttpTTSService` for ``base_url`` in this loop
       shares, and refreshed every 45 s, so Mirai's 75 s idle timeout never
       closes them.
     - ``websocket`` sockets to the streaming endpoint are opened and left
       waiting at ``session.ready``, with an empty ``session.update`` every
       30 s against Mirai's 120 s idle timeout. Each
-      :class:`~pipecat_mirai.MiraiWebsocketTTSService` with the same URL and
+      :class:`~pipecat_mirai.MiraiTTSService` with the same URL and
       API key takes one when its pipeline starts, and a replacement is opened
       in the background. A socket serves one pipeline and is closed when it
       ends. Sockets open on Mirai's edge when it is available, as the
@@ -75,13 +75,13 @@ async def prewarm(
 
     Args:
         api_key: Mirai API key. Defaults to ``MIRAI_API_KEY`` (or ``MIRA_API_KEY``).
-        base_url: API base URL, as given to ``MiraiTTSService``.
+        base_url: API base URL, as given to the services.
         connections: HTTP connections to keep open (0 to 64).
         websocket: WebSocket sockets to keep waiting.
         websocket_url: The streaming endpoint, as given to
-            ``MiraiWebsocketTTSService``. Defaults to ``base_url`` with
+            ``MiraiTTSService``. Defaults to ``base_url`` with
             ``wss://`` and ``/audio/speech/stream``.
-        edge: As given to ``MiraiWebsocketTTSService`` (``"auto"``,
+        edge: As given to ``MiraiTTSService`` (``"auto"``,
             ``False`` or an edge URL); waiting sockets go only to services
             with the same setting.
         timeout: Seconds to wait for the connections to open.

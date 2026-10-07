@@ -23,7 +23,7 @@ from pipecat.pipeline.worker import PipelineParams
 from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.tests.utils import SleepFrame, run_test
 
-from pipecat_mirai import MiraiTTSService
+from pipecat_mirai import MiraiHttpTTSService
 
 SR = 48000
 TEXT = "नमस्ते, मैं आपकी कैसे मदद कर सकती हूँ?"
@@ -275,7 +275,7 @@ class Recorder(FrameProcessor):
 
 
 def tts_for(fake, **kwargs):
-    return MiraiTTSService(api_key="k", http_client=fake.client(), **kwargs)
+    return MiraiHttpTTSService(api_key="k", http_client=fake.client(), **kwargs)
 
 
 # --- server-side sample rate -------------------------------------------------------------
@@ -361,7 +361,7 @@ async def test_explicit_server_sample_rate_is_resampled_to_the_output_rate():
 @pytest.mark.parametrize("bad", [11025, 32000, "fast", True, 8000.0])
 def test_invalid_server_sample_rate_is_refused(bad):
     with pytest.raises(ValueError, match="server_sample_rate"):
-        MiraiTTSService(api_key="k", server_sample_rate=bad)
+        MiraiHttpTTSService(api_key="k", server_sample_rate=bad)
 
 
 async def test_unreadable_rate_header_is_an_error():
@@ -380,7 +380,7 @@ async def test_non_pcm_encoding_is_an_error():
 async def test_server_that_rejects_sample_rate_is_retried_once_and_remembered():
     fake = FakeMirai(seconds=1.0, rejects_rate=True)
     async with fake.serve() as url:
-        tts = MiraiTTSService(api_key="k", base_url=url, warm_connection=False)
+        tts = MiraiHttpTTSService(api_key="k", base_url=url, warm_connection=False)
         down, up = await speak(tts, 8000, "पहला", "दूसरा")
     assert [b.get("sample_rate") for b in fake.speech] == [8000, None, None]
     assert [b["input"] for b in fake.speech] == ["पहला", "पहला", "दूसरा"]
@@ -403,11 +403,11 @@ async def test_bad_request_is_reported_and_sample_rate_kept():
 
 async def test_request_shape_and_settings():
     fake = FakeMirai()
-    tts = MiraiTTSService(
+    tts = MiraiHttpTTSService(
         api_key="sk_test",
         base_url="https://example.test/v1/",
         http_client=fake.client(),
-        settings=MiraiTTSService.Settings(voice="shruti"),
+        settings=MiraiHttpTTSService.Settings(voice="shruti"),
     )
     await speak(tts, 8000, "हाँ जी")
     req = next(r for r in fake.requests if r["method"] == "POST")
@@ -448,7 +448,7 @@ def test_requires_api_key(monkeypatch):
     monkeypatch.delenv("MIRAI_API_KEY", raising=False)
     monkeypatch.delenv("MIRA_API_KEY", raising=False)
     with pytest.raises(ValueError):
-        MiraiTTSService()
+        MiraiHttpTTSService()
 
 
 # --- connection reuse ----------------------------------------------------------------------
@@ -457,7 +457,7 @@ def test_requires_api_key(monkeypatch):
 async def test_utterances_share_one_connection():
     fake = FakeMirai()
     async with fake.serve() as url:
-        tts = MiraiTTSService(api_key="k", base_url=url, warm_connection=False)
+        tts = MiraiHttpTTSService(api_key="k", base_url=url, warm_connection=False)
         down, up = await speak(tts, 8000, "पहला", "दूसरा")
     assert [(r["method"], r["path"], r["conn"]) for r in fake.requests] == [
         ("POST", "/v1/audio/speech", 1),
@@ -473,7 +473,7 @@ async def test_warm_up_opens_the_connection_before_the_first_sentence(monkeypatc
     monkeypatch.setenv("MIRAI_WARM_CONNECTIONS", "1")  # the shared pool keeps one open
     fake = FakeMirai()
     async with fake.serve() as url:
-        tts = MiraiTTSService(api_key="sk_test", base_url=url, shared_pool=shared_pool)
+        tts = MiraiHttpTTSService(api_key="sk_test", base_url=url, shared_pool=shared_pool)
         _, up = await speak(tts, 8000, "पहला", "दूसरा", before=[SleepFrame(0.3)])
     assert [(r["method"], r["path"], r["conn"]) for r in fake.requests] == [
         ("GET", "/v1/models", 1),
@@ -502,14 +502,14 @@ async def test_warm_up_can_be_turned_off():
 @pytest.mark.parametrize("bad", [{"prebuffer_secs": -0.1}, {"keep_warm_secs": 0}, {"keep_warm_secs": -5}])
 def test_invalid_buffering_options_are_refused(bad):
     with pytest.raises(ValueError):
-        MiraiTTSService(api_key="k", **bad)
+        MiraiHttpTTSService(api_key="k", **bad)
 
 
 async def test_keep_warm_pings_an_idle_connection_only_while_the_pipeline_runs():
     # A client of the service's own (the shared pool refreshes its connections itself).
     fake = FakeMirai()
     async with fake.serve() as url:
-        tts = MiraiTTSService(api_key="k", base_url=url, keep_warm_secs=1.0, shared_pool=False)
+        tts = MiraiHttpTTSService(api_key="k", base_url=url, keep_warm_secs=1.0, shared_pool=False)
         await speak(tts, 8000, before=[SleepFrame(0.3)], after=[SleepFrame(2.6)])
         at_stop = len(fake.requests)
         await asyncio.sleep(1.5)
@@ -613,7 +613,7 @@ async def test_interruption_cuts_the_stream_and_nothing_leaks_into_the_next_sent
     fake = FakeMirai(seconds={"लंबा": 20.0, "छोटा": 0.5}, reads=(3200,), pace=0.05)
     rec = Recorder()
     async with fake.serve() as url:
-        tts = MiraiTTSService(api_key="k", base_url=url, shared_pool=False)
+        tts = MiraiHttpTTSService(api_key="k", base_url=url, shared_pool=False)
         await run_test(
             Pipeline([tts, rec]),
             frames_to_send=[
@@ -658,7 +658,7 @@ async def test_interruption_closes_a_stream_paused_between_frames():
     rec = Recorder()
     held = []
     async with fake.serve() as url:
-        tts = MiraiTTSService(api_key="k", base_url=url, warm_connection=False)
+        tts = MiraiHttpTTSService(api_key="k", base_url=url, warm_connection=False)
         append, run_tts = tts.append_to_audio_context, tts.run_tts
 
         async def slow_append(context_id, frame):

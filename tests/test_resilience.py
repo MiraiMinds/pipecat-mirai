@@ -19,7 +19,7 @@ from pipecat.services.tts_service import TextAggregationMode
 from pipecat.tests.utils import SleepFrame, run_test
 from test_tts import TEXT, FakeMirai, Recorder, audio_of, errors_in, speak, tone
 
-from pipecat_mirai import MiraiTTSService, MiraiWebsocketTTSService, close_shared_connections
+from pipecat_mirai import MiraiHttpTTSService, MiraiWebsocketTTSService, close_shared_connections
 from pipecat_mirai import tts as tts_module
 
 KEY = "sk_test"
@@ -42,7 +42,7 @@ def mirai_error(up):
 
 
 def http_tts(url, **kwargs):
-    return MiraiTTSService(api_key=KEY, base_url=url, **kwargs)
+    return MiraiHttpTTSService(api_key=KEY, base_url=url, **kwargs)
 
 
 # --- HTTP: Mirai busy, rate limits, server errors ------------------------------------------

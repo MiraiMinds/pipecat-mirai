@@ -9,15 +9,15 @@
 Each call is the bot a customer builds from our README:
 
   fake LLM (a Hindi/Hinglish reply streamed token by token, ~40 tokens/s)
-    -> MiraiWebsocketTTSService (or --tts http: MiraiTTSService), 8 kHz pipeline
+    -> MiraiTTSService (WebSocket; or --tts http: MiraiHttpTTSService), 8 kHz pipeline
     -> FastAPIWebsocketTransport + TwilioFrameSerializer (8 kHz mu-law),
        apply_output_lead(transport, --lead)
     -> a phone simulator that plays the media at exactly real time, like a
        carrier, and records what the caller hears (one WAV per call).
 
 --defaults builds the bot the way a customer who only installed the package
-writes it: MiraiTTSService(api_key=key, voice=voice) or
-MiraiWebsocketTTSService(api_key=key, voice=voice) and nothing else, and no
+writes it: MiraiTTSService(api_key=key, voice=voice) (or
+MiraiHttpTTSService(api_key=key, voice=voice)) and nothing else, and no
 apply_output_lead. base_url/url are passed only with --standin, --url or
 --http-url: the library's defaults point at Mirai's production endpoint.
 
@@ -345,7 +345,12 @@ def bot_main(a):
     import pipecat_mirai
 
     # Only names pipecat-mirai 0.3.0 has too: this harness runs against both releases.
-    from pipecat_mirai import MiraiTTSService, MiraiWebsocketTTSService, apply_output_lead
+    from pipecat_mirai import apply_output_lead
+
+    # 0.5.0 renamed the HTTP service MiraiHttpTTSService (MiraiTTSService is now the
+    # WebSocket one); before that, MiraiTTSService was HTTP. Works with either.
+    MiraiHttpTTS = getattr(pipecat_mirai, "MiraiHttpTTSService", None) or pipecat_mirai.MiraiTTSService
+    MiraiWsTTS = pipecat_mirai.MiraiWebsocketTTSService
 
     exit_after(a.max_runtime + 5)
     logger.remove()
@@ -394,12 +399,12 @@ def bot_main(a):
             # one was given: the library's default is the production endpoint.
             if a.tts == "http":
                 extra = {"base_url": a.http_url} if a.http_url else {}
-                return MiraiTTSService(api_key=key, voice=a.voice, **extra)
+                return MiraiHttpTTS(api_key=key, voice=a.voice, **extra)
             extra = {"url": a.url} if a.url else {}
-            return MiraiWebsocketTTSService(api_key=key, voice=a.voice, **extra)
+            return MiraiWsTTS(api_key=key, voice=a.voice, **extra)
         if a.tts == "http":
-            return MiraiTTSService(api_key=key, base_url=a.http_url, voice=a.voice)
-        return MiraiWebsocketTTSService(api_key=key, url=a.url, voice=a.voice)
+            return MiraiHttpTTS(api_key=key, base_url=a.http_url, voice=a.voice)
+        return MiraiWsTTS(api_key=key, url=a.url, voice=a.voice)
 
     def note_lead(call, output):
         """The lead the transport ended up with: the harness's (explicit mode) or the library's own."""
@@ -512,7 +517,7 @@ def bot_main(a):
         if not a.defaults:
             apply_output_lead(transport, a.lead)
         tts = make_tts()
-        is_ws = isinstance(tts, MiraiWebsocketTTSService)
+        is_ws = isinstance(tts, MiraiWsTTS)
         info["endpoint"] = info["endpoint"] or getattr(tts, "_url" if is_ws else "_speech_url", None)
         if is_ws and hasattr(tts, "_on_audio_start") and hasattr(tts, "_retry_later"):
             on_audio_start, retry_later = tts._on_audio_start, tts._retry_later

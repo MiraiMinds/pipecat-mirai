@@ -87,8 +87,8 @@ class MiraiTTSError(Exception):
 class _HTTPSpeech:
     """Mirai's HTTP endpoint: one streaming ``POST /v1/audio/speech`` per sentence.
 
-    Shared by :class:`MiraiTTSService` and the HTTP fallback of
-    :class:`~pipecat_mirai.MiraiWebsocketTTSService`. The host sets
+    Shared by :class:`MiraiHttpTTSService` and the HTTP fallback of
+    :class:`~pipecat_mirai.MiraiTTSService`. The host sets
     ``_speech_url``, ``_headers``, ``_settings``, ``_server_rate_option``,
     ``_prebuffer_secs`` and the state below, and provides ``_client()``.
     """
@@ -325,11 +325,16 @@ class _HTTPSpeech:
             await response.aclose()
 
 
-class MiraiTTSService(_HTTPSpeech, TTSService):
-    """Stream Mirai TTS audio into a Pipecat pipeline.
+class MiraiHttpTTSService(_HTTPSpeech, TTSService):
+    """Mirai TTS over HTTP: one streaming request per sentence.
+
+    Most bots should use :class:`~pipecat_mirai.MiraiTTSService`, which streams
+    over a WebSocket from Mirai's edge and falls back to HTTP by itself. This
+    service is for when you want HTTP only (it was ``MiraiTTSService`` before
+    0.5.0).
 
     Each sentence is one streaming HTTP request over a kept-alive connection.
-    The connections are shared by every ``MiraiTTSService`` for the same
+    The connections are shared by every ``MiraiHttpTTSService`` for the same
     ``base_url`` in the process and kept warm on their own (see
     :mod:`pipecat_mirai.pool`), so calls that start together, or a call after
     a quiet spell, don't wait for a TCP and TLS handshake. Audio is pushed in
@@ -347,9 +352,9 @@ class MiraiTTSService(_HTTPSpeech, TTSService):
 
     Example::
 
-        tts = MiraiTTSService(
+        tts = MiraiHttpTTSService(
             api_key=os.getenv("MIRAI_API_KEY"),
-            settings=MiraiTTSService.Settings(voice="shruti"),
+            settings=MiraiHttpTTSService.Settings(voice="shruti"),
         )
     """
 
@@ -427,7 +432,7 @@ class MiraiTTSService(_HTTPSpeech, TTSService):
         """
         key = api_key or os.getenv("MIRAI_API_KEY") or os.getenv("MIRA_API_KEY")
         if not key:
-            raise ValueError("Set MIRAI_API_KEY or pass api_key to MiraiTTSService.")
+            raise ValueError("Set MIRAI_API_KEY or pass api_key to MiraiHttpTTSService.")
         _check_server_rate(server_sample_rate)
         if not prebuffer_secs >= 0:
             raise ValueError(f"prebuffer_secs must be >= 0; got {prebuffer_secs!r}")

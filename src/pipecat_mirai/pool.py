@@ -13,12 +13,12 @@ connection after that. But calls that start together (a load test, a burst
 of real calls) each pay it on their first sentence, the greeting, unless
 connections are already open when they start. This module keeps them open:
 
-- HTTP: every :class:`~pipecat_mirai.MiraiTTSService` in an event loop shares
+- HTTP: every :class:`~pipecat_mirai.MiraiHttpTTSService` in an event loop shares
   one client per base URL. Its connections are tracked one by one, so the
   pool knows exactly which are open and idle, refreshes each before Mirai's
   75 s idle timeout, and opens more when fewer are warm than calls may need.
 - WebSocket: authenticated sockets wait at ``session.ready``;
-  :class:`~pipecat_mirai.MiraiWebsocketTTSService` takes one when its
+  :class:`~pipecat_mirai.MiraiTTSService` takes one when its
   pipeline starts instead of connecting, and the pool opens a replacement.
   Sockets open on Mirai's edge when it is available (see
   :mod:`pipecat_mirai.edge`), and on the gateway otherwise; a gateway socket
