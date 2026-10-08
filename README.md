@@ -134,12 +134,13 @@ the rate of the latest sentence. Pipecat's `on_connected`, `on_disconnected` and
 Mirai sets two limits per workspace, shared by every process that uses your key
 ([full table](https://docs.miraiminds.co/v2/limits)):
 
-- **Sentences being generated at once: 10.** This is concurrency in the sense
-  that matters: a call only holds a slot while one of its sentences is being
-  generated (well under a second each), not for the whole call, so 10 slots
-  carry more than 10 live calls. When more sentences than that start at the
-  same moment, the extra ones wait for a slot (up to 3 s), which shows up as a
-  longer time to first byte, and past that the service reports `at_capacity`.
+- **Sentences in flight at once: 10.** A call holds a slot while one of its
+  sentences is streaming, which is most of the time its bot is speaking, and
+  none while the caller talks. So 10 slots carry 10 bots speaking at the same
+  moment (more live calls than that, since nobody speaks all the time). When
+  more sentences than that start together, the extra ones wait for a slot (up
+  to 3 s), which shows up as a longer time to first byte, and past that the
+  service reports `at_capacity`.
 - **Open sockets.** One per live call, plus the few each process keeps waiting
   (2, or the recent peak of calls plus 2).
 
