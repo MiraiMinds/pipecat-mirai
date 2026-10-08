@@ -87,7 +87,12 @@ WS_MAX_BACKOFF_SECS = 60.0
 # Kept warm from the first service on (MIRAI_WARM_CONNECTIONS /
 # MIRAI_WARM_WEBSOCKETS override; 0 turns the automatic warm-up off).
 AUTO_CONNECTIONS = 10
-AUTO_WEBSOCKETS = 10
+# Waiting sockets per process until more calls than that have run at once. Small
+# on purpose: a deployment that runs one process per call (one bot per process,
+# Pipecat Cloud, a pod per agent) multiplies it by the number of processes, and
+# every waiting socket counts against the workspace's open-socket limit. Ten
+# processes at 10 each wanted 100 sockets and starved real calls (2026-10-08).
+AUTO_WEBSOCKETS = 2
 # More than the recent peak of concurrent calls, up to AUTO_MAX.
 AUTO_HEADROOM = 2
 AUTO_MAX = 32
@@ -815,7 +820,7 @@ class WebsocketPool:
         """
         websocket = None
         try:
-            on_edge = await self.edge.open(self._connect) if self.edge is not None else None
+            on_edge = await self.edge.open(self._connect, refusals="raise") if self.edge is not None else None
             if on_edge is not None:
                 websocket, event = on_edge.websocket, on_edge.ready
                 pooled = PooledWebsocket(websocket, url=on_edge.url, edge=True)
@@ -865,7 +870,10 @@ class WebsocketPool:
                 backoff = WS_MAX_BACKOFF_SECS  # retrying soon won't change the answer
             self._retry_at = time.monotonic() + backoff
             self.last_error = f"HTTP {status}" if status else repr(exc)
-            log = logger.warning if status in (401, 402, 403) or self._failures == 1 else logger.debug
+            # 429 is crowding (many workers warming up against one workspace's limits):
+            # the pool backs off and calls are unaffected, so it isn't worth a warning.
+            loud = status in (401, 402, 403) or (self._failures == 1 and status != 429)
+            log = logger.warning if loud else logger.debug
             log(f"Mirai: could not open a waiting socket to {self.url}: {self.last_error}")
             if websocket is not None:
                 await _close_quietly(websocket)

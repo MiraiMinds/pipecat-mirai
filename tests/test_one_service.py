@@ -3,11 +3,11 @@
 import httpx
 import pytest
 from fake_mirai_ws import FakeMiraiWS, tone
-from pipecat.frames.frames import TTSSpeakFrame
+from pipecat.frames.frames import ErrorFrame, TTSSpeakFrame
 from test_tts_websocket import TEXT, audio_of, run
 
 import pipecat_mirai
-from pipecat_mirai import MiraiHttpTTSService, MiraiTTSService, MiraiWebsocketTTSService
+from pipecat_mirai import MiraiHttpTTSService, MiraiTTSService, MiraiWebsocketTTSService, tts_websocket
 from pipecat_mirai.tts_websocket import _stream_url
 
 
@@ -69,3 +69,24 @@ async def test_code_written_for_the_http_service_now_streams_over_the_websocket(
         rec, down, _ = await run(tts, 8000, [TTSSpeakFrame(TEXT)])
     assert len(fake.handshakes) == 1
     assert audio_of(down, 8000) == tone(0.5, 8000)
+
+
+async def test_a_socket_refused_with_429_is_retried_before_the_call_gives_up():
+    # Many workers starting at once can run into the key's request rate: the call
+    # waits Retry-After and connects, instead of losing its speech.
+    fake = FakeMiraiWS(rate_limit_attempts={1, 2})
+    async with fake.serve() as url:
+        tts = MiraiTTSService(api_key="sk_test", url=url, shared_pool=False, edge=False)
+        _, down, up = await run(tts, 8000, [TTSSpeakFrame(TEXT)])
+    assert fake.attempts == 3
+    assert audio_of(down, 8000) == tone(0.5, 8000)
+
+
+async def test_a_lasting_429_is_still_reported(monkeypatch):
+    monkeypatch.setattr(tts_websocket, "CONNECT_RETRY_SECS", 0.5)
+    fake = FakeMiraiWS(refuse_status=429)
+    async with fake.serve() as url:
+        tts = MiraiTTSService(api_key="sk_test", url=url, shared_pool=False, edge=False, http_fallback=False)
+        _, down, up = await run(tts, 8000, [TTSSpeakFrame(TEXT)])
+    assert fake.attempts >= 2
+    assert any(isinstance(f, ErrorFrame) for f in up)

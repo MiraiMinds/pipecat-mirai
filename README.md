@@ -129,6 +129,23 @@ Billing is per character, as on Mirai's HTTP endpoint.
 the rate of the latest sentence. Pipecat's `on_connected`, `on_disconnected` and
 `on_connection_error` events fire as the socket opens and closes.
 
+### Limits
+
+Mirai sets two limits per workspace, shared by every process that uses your key
+([full table](https://docs.miraiminds.co/v2/limits)):
+
+- **Sentences being generated at once: 10.** This is concurrency in the sense
+  that matters: a call only holds a slot while one of its sentences is being
+  generated (well under a second each), not for the whole call, so 10 slots
+  carry more than 10 live calls. When more sentences than that start at the
+  same moment, the extra ones wait for a slot (up to 3 s), which shows up as a
+  longer time to first byte, and past that the service reports `at_capacity`.
+- **Open sockets.** One per live call, plus the few each process keeps waiting
+  (2, or the recent peak of calls plus 2).
+
+If you plan a load test with more than 10 calls starting together, tell us the
+number and we raise your workspace's limits before you start.
+
 ### Sample rate
 
 The service asks Mirai for audio at your pipeline's output rate when Mirai
