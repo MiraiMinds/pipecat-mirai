@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.1] - 2026-10-08
+
+### Fixed
+
+- Many worker processes against one workspace (one bot per process, a pod per
+  agent) no longer starve real calls. Each process kept 10 sockets waiting, and
+  10 processes wanted 100: past the workspace's open-socket limit the waiting
+  sockets spilled onto the API's request rate limit, and a call's own socket
+  could be refused (`429`). Now:
+  - each process keeps 2 sockets waiting until more calls than that run at once
+    (then the recent peak plus 2, as before; `MIRAI_WARM_WEBSOCKETS` sets it);
+  - a waiting socket the edge refuses backs off instead of opening on the API;
+  - a call whose socket is refused with `429` waits `Retry-After` and tries
+    again for up to 5 s before reporting it.
+- A refused warm-up socket (`429`) is logged at debug level, not as a warning.
+
 ## [0.5.0] - 2026-10-07
 
 ### Changed

@@ -211,11 +211,15 @@ class EdgeRoute:
             return time.monotonic() + 0.5  # a try is under way
         return state.retry_at
 
-    async def open(self, connect: Connect) -> EdgeSocket | None:
+    async def open(self, connect: Connect, *, refusals: str = "gateway") -> EdgeSocket | None:
         """A socket on the edge, past ``session.ready``; ``None``: use the gateway.
 
         ``connect(url, headers, extra)`` opens a WebSocket (``extra``: connect
-        kwargs such as a pre-connected socket).
+        kwargs such as a pre-connected socket). ``refusals``: what happens when
+        the edge refuses this key (401/402/403/429): ``"gateway"`` returns
+        ``None`` so a call opens on the gateway, which gives the reason in its own
+        words; ``"raise"`` raises the refusal, for a pool's warm-up, which must back
+        off rather than spend the gateway's rate limit on a socket nobody asked for.
         """
         loop = asyncio.get_running_loop()
         loop_key = (*self._key, id(loop))
@@ -228,7 +232,7 @@ class EdgeRoute:
                 # at once. A burst of calls at start-up must not queue behind one
                 # probe (measured: 20 sockets spread over 3.3 s). Only after the
                 # edge has failed does one socket probe while the rest wait.
-                return await self._attempt(connect)
+                return await self._attempt(connect, refusals)
             with _lock:
                 probe = _probes.get(loop_key)
                 if probe is None:
@@ -238,7 +242,7 @@ class EdgeRoute:
                     mine = False
             if mine:
                 try:
-                    return await self._attempt(connect)
+                    return await self._attempt(connect, refusals)
                 finally:
                     with _lock:
                         if _probes.get(loop_key) is probe:
@@ -248,7 +252,7 @@ class EdgeRoute:
             # Another socket is finding out whether the edge works: wait for its answer.
             await asyncio.wait({probe})
 
-    async def _attempt(self, connect: Connect) -> EdgeSocket | None:
+    async def _attempt(self, connect: Connect, refusals: str = "gateway") -> EdgeSocket | None:
         try:
             url = await self._edge_url()
         except _NoEdge as exc:
@@ -276,6 +280,8 @@ class EdgeRoute:
             return None
         except Exception as exc:
             if _status(exc) in _KEY_REFUSALS:
+                if refusals == "raise":
+                    raise
                 # The key, the wallet or a limit: the gateway says which, and the edge stays in use.
                 logger.debug(f"Mirai: the TTS edge refused this key ({_describe(exc)}); using the gateway")
                 return None

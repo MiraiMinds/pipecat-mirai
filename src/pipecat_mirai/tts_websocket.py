@@ -61,6 +61,7 @@ from pipecat_mirai.pacing import DEFAULT_LEAD_SECS, ensure_output_lead
 from pipecat_mirai.pool import (
     SharedHTTPClient,
     WebsocketPool,
+    _retry_after,
     shared_http_client,
     take_websocket,
     websocket_pool,
@@ -76,6 +77,12 @@ from pipecat_mirai.tts import (
 )
 
 DEFAULT_WEBSOCKET_URL = "wss://sandbox.voice.miraiminds.co/v1/audio/speech/stream"
+# A socket refused with 429 (the key's request rate, or the workspace's open-socket
+# limit) is retried for this long, waiting Retry-After (at most CONNECT_RETRY_WAIT
+# at a time), before the call reports it: the refusal is usually a moment's
+# crowding, such as many workers starting at once.
+CONNECT_RETRY_SECS = 5.0
+CONNECT_RETRY_WAIT = 2.0
 _UNSET: Any = object()
 # A capacity error is retried once when Mirai asks for a wait no longer than
 # this. Longer than that, a caller would sit through the silence; it is
@@ -612,8 +619,7 @@ class MiraiTTSService(_HTTPSpeech, WebsocketTTSService):
                 await self._on_event(on_edge.ready)  # its session id and limits
             else:
                 logger.debug(f"{self}: connecting to {self._url}")
-                extra = await asyncio.wait_for(websocket_connect_kwargs(self._url), 10.0)
-                self._websocket = await self._connect_to(self._url, self._headers, extra)
+                self._websocket = await self._connect_gateway()
                 self.connected_url = self._url
             self._cancelled.clear()
             self._sentence = None
@@ -623,6 +629,26 @@ class MiraiTTSService(_HTTPSpeech, WebsocketTTSService):
         for turn in list(self._turns.values()):
             if turn.held is not None and turn.retry_task is None:
                 await self._send_held(turn)
+
+    async def _connect_gateway(self):
+        """Open ``url``, waiting out a 429 for up to ``CONNECT_RETRY_SECS``."""
+        deadline = time.monotonic() + CONNECT_RETRY_SECS
+        while True:
+            extra = await asyncio.wait_for(websocket_connect_kwargs(self._url), 10.0)
+            try:
+                return await self._connect_to(self._url, self._headers, extra)
+            except Exception as exc:
+                sock = extra.get("sock")
+                if sock is not None:
+                    sock.close()
+                response = getattr(exc, "response", None)
+                if getattr(response, "status_code", None) != 429:
+                    raise
+                wait = min(CONNECT_RETRY_WAIT, _retry_after(response, 1.0))
+                if time.monotonic() + wait > deadline:
+                    raise
+                logger.debug(f"{self}: Mirai answered 429 to the socket; trying again in {wait:g} s")
+                await asyncio.sleep(wait)
 
     async def _connect_to(self, url: str, headers: dict[str, str], extra: dict[str, Any]):
         return await self._websocket_connect(

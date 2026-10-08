@@ -524,3 +524,21 @@ async def test_a_refused_key_goes_to_the_gateway_without_putting_the_edge_off(kn
         assert tts.connected_url == s.url and len(s.delhi.handshakes) == 1
         assert edge_warnings() == []  # a key problem is not an edge problem
         assert edge_module._health[(edge_module.token_url(s.url), "auto")].retry_at == 0.0
+
+
+# --- crowding: many workers, one workspace -----------------------------------------------
+
+
+async def test_a_pool_refused_by_the_edge_backs_off_instead_of_filling_the_gateway(known_edge):
+    # The edge is at the workspace's open-socket limit (429). Waiting sockets nobody
+    # asked for must not move to the gateway and spend its rate limit; a call still
+    # speaks, through the gateway.
+    async with stack(edge={"refuse_status": 429}) as s:
+        known_edge(s)
+        result = await prewarm(api_key=KEY, connections=0, websocket=3, websocket_url=s.url, timeout=1.0)
+        assert result.websockets == 0 and result.errors
+        assert s.delhi.handshakes == []  # nothing spilled onto the gateway
+        tts = ws_tts(s.url, shared_pool=False)
+        _, up = await ws_call(tts)
+        assert not errors_in(up) and tts.connected_url == s.url
+        assert len(s.delhi.handshakes) == 1

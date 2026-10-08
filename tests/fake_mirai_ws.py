@@ -97,6 +97,7 @@ class FakeMiraiWS:
         close_after=None,
         refuse_status=None,
         refuse_attempts=(),
+        rate_limit_attempts=(),
         base64=False,
         auth=None,
         silent=False,
@@ -116,6 +117,7 @@ class FakeMiraiWS:
         self.close_after = close_after
         self.refuse_status = refuse_status
         self.refuse_attempts = set(refuse_attempts)  # handshake attempts (1-based) answered 503
+        self.rate_limit_attempts = set(rate_limit_attempts)  # handshake attempts answered 429
         self.attempts = 0
         self.base64 = base64
         self.auth = auth
@@ -155,7 +157,17 @@ class FakeMiraiWS:
                 return Response(401, "Unauthorized", _headers(len(body)), body.encode())
             if self.refuse_status:
                 body = json.dumps({"error": {"code": "unauthorized", "message": "invalid API key"}})
-                return Response(self.refuse_status, "Refused", _headers(len(body)), body.encode())
+                headers = _headers(len(body))
+                if self.refuse_status == 429:
+                    headers["Retry-After"] = "0.1"
+                return Response(self.refuse_status, "Refused", headers, body.encode())
+            if self.attempts in self.rate_limit_attempts:
+                body = json.dumps(
+                    {"error": {"code": "rate_limited", "message": "request rate limit exceeded"}}
+                )
+                headers = _headers(len(body))
+                headers["Retry-After"] = "0.1"
+                return Response(429, "Too Many Requests", headers, body.encode())
             if self.attempts in self.refuse_attempts:
                 body = json.dumps({"error": {"code": "unavailable", "message": "restarting"}})
                 return Response(503, "Unavailable", _headers(len(body)), body.encode())
