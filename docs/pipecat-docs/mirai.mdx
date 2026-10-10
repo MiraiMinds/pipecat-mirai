@@ -1,7 +1,7 @@
 ---
-title: "Mirai Text-to-Speech"
+title: "Mirai Text-to-Speech and Speech-to-Text"
 sidebarTitle: "Mirai"
-description: "MiraiTTSService streams natural Hindi, Hinglish and Gujarati speech from Mirai's TTS API."
+description: "MiraiTTSService streams natural Hindi, Hinglish and Gujarati speech, and MiraiSTTService streams transcripts back, from Mirai's APIs."
 ---
 
 import { CommunityMaintained } from "/snippets/community-maintained.mdx";
@@ -21,6 +21,8 @@ with English words in Latin script) and Gujarati. Audio streams over HTTP with a
 
 The package also includes:
 
+- `MiraiSTTService`, for Mirai's streaming speech-to-text (see below): partial and
+  final transcripts over one WebSocket, at 8 kHz as it comes off the phone.
 - `MiraiRealtimeLLMService`, for Mirai's speech-to-speech Realtime API (OpenAI
   Realtime protocol). Speech recognition, turn detection, the model and the voice
   run together on Mirai's side, and this one service replaces STT, LLM and TTS.
@@ -129,6 +131,80 @@ apply_output_lead(transport)  # up to 0.4 s ahead of real time
 
 On 8 kHz Twilio-protocol calls with event-loop stalls, measured speech stretched by
 breaks dropped from 6.6% to 0.08% at 3 concurrent calls and from 29.1% to 0.01% at 10.
+
+## Speech-to-text
+
+`MiraiSTTService` streams the caller's audio to Mirai's
+`/v1/audio/transcriptions/stream` WebSocket and emits `InterimTranscriptionFrame` for
+partial transcripts and one `TranscriptionFrame` per utterance, in order. It needs the
+same `MIRAI_API_KEY`.
+
+```python
+from pipecat_mirai import MiraiSTTService
+
+stt = MiraiSTTService(api_key=os.getenv("MIRAI_API_KEY"), language="hi-IN")
+
+pipeline = Pipeline([
+    transport.input(),
+    stt,
+    context_aggregator.user(),
+    llm,
+    tts,
+    transport.output(),
+    context_aggregator.assistant(),
+])
+```
+
+<ParamField path="language" type="str | Language" default="hi-IN">
+  `hi-IN`, `en-IN`, `gu-IN`, `mr-IN`, `pa-IN`, `bn-IN`, `ta-IN`, `te-IN`, `kn-IN` or
+  `ml-IN`. Changes on the open socket.
+</ParamField>
+
+<ParamField path="model" type="str" default="mira-stt">
+  Mirai's streaming model.
+</ParamField>
+
+<ParamField path="sample_rate" type="int | str" default="auto">
+  The rate audio is sent at. `"auto"` sends an 8 kHz pipeline's audio as it is and
+  resamples any other rate to 16 kHz. `8000` or `16000` forces one.
+</ParamField>
+
+<ParamField path="encoding" type="str" default="auto">
+  `"auto"` (linear16), `"linear16"`, or `"mulaw"` / `"alaw"` (8 kHz only; half the bytes).
+</ParamField>
+
+<ParamField path="endpointing" type="str" default="auto">
+  Who ends an utterance. `"manual"`: your pipeline's VAD. Its start and stop become
+  `speech_start` and `speech_end` (with 0.5 s of audio from before the VAD fired, so
+  the first word isn't cut), and nothing is sent between turns. `"vad"`: Mirai's VAD;
+  audio streams continuously and the service proposes turn boundaries to the user
+  aggregator. `"auto"` picks `"manual"` when the pipeline has a VAD.
+</ParamField>
+
+<ParamField path="edge" type="bool | str" default="auto">
+  Open sockets on Mirai's STT edge, next to the GPUs, when it is offered, and on `url`
+  otherwise. `False` always uses `url`. `MIRAI_STT_EDGE=off` turns it off for the process.
+</ParamField>
+
+<ParamField path="url" type="str" default="wss://sandbox.voice.miraiminds.co/v1/audio/transcriptions/stream">
+  The streaming endpoint.
+</ParamField>
+
+<ParamField path="shared_pool" type="bool" default="True">
+  Take a socket the process's pool opened ahead of need. `prewarm(stt_websockets=...)`
+  or `MIRAI_WARM_STT_WEBSOCKETS` sets how many wait (2 by default).
+</ParamField>
+
+<ParamField path="settings" type="MiraiSTTSettings" default="None">
+  Runtime-updatable settings: `language`, `model`, `stream_type` (`"fast"` or
+  `"balanced"`), `mode` (`"transcribe"` or `"codemix"`) and, with Mirai's VAD,
+  `threshold`, `silence_duration_ms`, `min_speech_duration_ms` and `prefix_padding_ms`.
+</ParamField>
+
+Time to first byte is reported from `speech_end` sent to the final, and usage as the
+audio seconds sent. If the socket drops, the service redials once and replays the
+audio Mirai hadn't answered (up to 30 s); a fatal error from Mirai arrives as an
+`ErrorFrame`.
 
 ## Compatibility
 

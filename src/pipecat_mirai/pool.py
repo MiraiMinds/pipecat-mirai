@@ -17,12 +17,13 @@ connections are already open when they start. This module keeps them open:
   one client per base URL. Its connections are tracked one by one, so the
   pool knows exactly which are open and idle, refreshes each before Mirai's
   75 s idle timeout, and opens more when fewer are warm than calls may need.
-- WebSocket: authenticated sockets wait at ``session.ready``;
-  :class:`~pipecat_mirai.MiraiTTSService` takes one when its
-  pipeline starts instead of connecting, and the pool opens a replacement.
-  Sockets open on Mirai's edge when it is available (see
-  :mod:`pipecat_mirai.edge`), and on the gateway otherwise; a gateway socket
-  is replaced by an edge one, one at a time, once the edge is back.
+- WebSocket: authenticated sockets wait at ``session.ready`` (speech) or
+  ``session.begin`` (transcription); :class:`~pipecat_mirai.MiraiTTSService`
+  and :class:`~pipecat_mirai.MiraiSTTService` take one when their pipeline
+  starts instead of connecting, and the pool opens a replacement. Sockets
+  open on Mirai's edge when it is available (see :mod:`pipecat_mirai.edge`),
+  and on the gateway otherwise; a gateway socket is replaced by an edge one,
+  one at a time, once the edge is back.
 
 Both start on their own when the first service of their kind starts, and keep
 ``max(AUTO, recent peak of concurrent calls + HEADROOM)`` warm from then on.
@@ -40,6 +41,7 @@ another (asyncio connections can't be), and two loops get separate pools.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import hashlib
 import json
@@ -49,6 +51,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 from loguru import logger
@@ -71,10 +74,13 @@ HTTP_TIMEOUT = httpx.Timeout(30.0, connect=10.0, read=15.0)
 WARM_REQUEST_TIMEOUT = 10.0
 
 # ---- WebSocket ----
-# A waiting socket gets an empty session.update after this long without a
+# A waiting TTS socket gets an empty session.update after this long without a
 # message (or half Mirai's idle timeout, if shorter); Mirai closes a socket
-# after 120 s without one.
+# after 120 s without one. A waiting STT socket gets a ping and 40 ms of
+# silence every STT_KEEPALIVE_SECS.
 WS_KEEPALIVE_SECS = 30.0
+STT_KEEPALIVE_SECS = 20.0
+STT_KEEPALIVE_AUDIO_SECS = 0.04
 WS_OPEN_TIMEOUT = 10.0
 WS_CLOSE_TIMEOUT = 2.0
 # A waiting socket is replaced once this much of Mirai's maximum session
@@ -107,7 +113,7 @@ WARM_PAUSE_SECS = 5.0
 
 _lock = threading.Lock()
 _http: dict[tuple[str, int], SharedHTTPClient] = {}
-_ws: dict[tuple[str, str, str | None, int], WebsocketPool] = {}
+_ws: dict[tuple[str, str, str, str | None, int], WebsocketPool] = {}
 _budgets: dict[tuple[str, int], _WarmBudget] = {}
 
 
@@ -603,9 +609,81 @@ def shared_http_client(base_url: str, *, create: bool = True) -> SharedHTTPClien
 # ------------------------------------------------------------------------------------ WebSocket
 
 
+def silence(url: str, secs: float) -> bytes:
+    """``secs`` of silence in the encoding and rate of an STT socket's query (default linear16, 16 kHz)."""
+    query = parse_qs(urlparse(url).query)
+    try:
+        rate = int(query.get("sample_rate", ["16000"])[0])
+    except ValueError:
+        rate = 16000
+    samples = max(1, int(rate * secs))
+    encoding = query.get("encoding", ["linear16"])[0]
+    if encoding == "mulaw":
+        return b"\xff" * samples
+    if encoding == "alaw":
+        return b"\xd5" * samples
+    return bytes(2 * samples)
+
+
+@dataclass(frozen=True)
+class SocketProtocol:
+    """What a waiting socket of one Mirai streaming service looks like.
+
+    ``kind`` is the JSON field that names an event (``type`` for speech,
+    ``event`` for transcription), ``ready`` the first event of a working
+    session, ``notes`` the events carrying its id and limits, ``closing``
+    the events worth a log line on a waiting socket, ``warm_env`` the
+    variable that sets how many sockets wait, and ``keepalive_setting`` the
+    module setting for how often a waiting socket is touched.
+    """
+
+    service: str
+    kind: str
+    ready: str
+    notes: tuple[str, ...]
+    closing: tuple[str, ...]
+    warm_env: str
+    keepalive_setting: str
+
+    @property
+    def keepalive_secs(self) -> float:
+        return globals()[self.keepalive_setting]
+
+    def kind_of(self, event: dict) -> Any:
+        return event.get(self.kind)
+
+    def keepalive(self, url: str) -> list[str]:
+        """The messages that keep a waiting socket open; none of them changes anything."""
+        if self.service == "stt":
+            audio = base64.b64encode(silence(url, STT_KEEPALIVE_AUDIO_SECS)).decode()
+            return [json.dumps({"event": "ping"}), json.dumps({"event": "audio_input", "audio": audio})]
+        return [json.dumps({"type": "session.update"})]
+
+
+TTS_PROTOCOL = SocketProtocol(
+    service="tts",
+    kind="type",
+    ready="session.ready",
+    notes=("session.ready", "session.updated"),
+    closing=("session.closed", "error"),
+    warm_env="MIRAI_WARM_WEBSOCKETS",
+    keepalive_setting="WS_KEEPALIVE_SECS",
+)
+STT_PROTOCOL = SocketProtocol(
+    service="stt",
+    kind="event",
+    ready="session.begin",
+    notes=("session.begin",),
+    closing=("session.draining", "session.end", "error"),
+    warm_env="MIRAI_WARM_STT_WEBSOCKETS",
+    keepalive_setting="STT_KEEPALIVE_SECS",
+)
+PROTOCOLS = {"tts": TTS_PROTOCOL, "stt": STT_PROTOCOL}
+
+
 @dataclass(eq=False)
 class PooledWebsocket:
-    """An open, authenticated socket that has had ``session.ready``."""
+    """An open, authenticated socket that has had ``session.ready`` (``session.begin`` for STT)."""
 
     websocket: Any
     url: str = ""  # where it is connected (the edge's URL, or the gateway's)
@@ -616,13 +694,15 @@ class PooledWebsocket:
     opened_at: float = field(default_factory=time.monotonic)
     last_sent: float = field(default_factory=time.monotonic)
     reader: asyncio.Task | None = None
+    protocol: SocketProtocol = TTS_PROTOCOL
+    ready: dict = field(default_factory=dict)  # the session.ready / session.begin event
 
     @property
     def is_open(self) -> bool:
         return self.websocket.state is State.OPEN
 
     def note(self, event: dict):
-        """Take the session id and limits from ``session.ready`` / ``session.updated``."""
+        """Take the session id and limits from ``session.ready`` / ``session.updated`` / ``session.begin``."""
         self.session_id = event.get("session_id") or self.session_id
         limits = event.get("limits") or {}
         idle = limits.get("idle_timeout_secs")
@@ -634,9 +714,10 @@ class PooledWebsocket:
 
     @property
     def keepalive_secs(self) -> float:
+        base = self.protocol.keepalive_secs
         if self.idle_timeout_secs:
-            return min(WS_KEEPALIVE_SECS, self.idle_timeout_secs / 2)
-        return WS_KEEPALIVE_SECS
+            return min(base, self.idle_timeout_secs / 2)
+        return base
 
     @property
     def max_age_secs(self) -> float:
@@ -648,12 +729,12 @@ class PooledWebsocket:
 class WebsocketPool:
     """Sockets to one URL with one API key, waiting for pipelines in one event loop.
 
-    ``target()`` sockets are kept open, each waiting at ``session.ready`` with
-    an empty ``session.update`` before Mirai's idle timeout. :meth:`take`
-    hands one to a single pipeline for good and wakes the pool to open a
-    replacement; a socket never comes back. With an ``edge`` route
-    (:class:`~pipecat_mirai.edge.EdgeRoute`) each socket opens on the edge
-    when it can, and on ``url`` (the gateway) when it can't.
+    ``target()`` sockets are kept open, each waiting at ``session.ready``
+    (``session.begin`` for STT) and touched before Mirai's idle timeout
+    (``protocol``). :meth:`take` hands one to a single pipeline for good and
+    wakes the pool to open a replacement; a socket never comes back. With an
+    ``edge`` route (:class:`~pipecat_mirai.edge.EdgeRoute`) each socket opens
+    on the edge when it can, and on ``url`` (the gateway) when it can't.
     """
 
     def __init__(
@@ -663,12 +744,14 @@ class WebsocketPool:
         loop: asyncio.AbstractEventLoop,
         max_size: int,
         edge: Any = None,
+        protocol: SocketProtocol = TTS_PROTOCOL,
     ):
         self.url = url
         self.headers = dict(headers)
         self.loop = loop
         self.max_size = max_size
         self.edge = edge
+        self.protocol = protocol
         self.floor: int | None = None
         self.auto = False
         self.peak = _Peak()
@@ -699,7 +782,7 @@ class WebsocketPool:
         if self.floor is not None:
             base = self.floor
         else:
-            base = _env_int("MIRAI_WARM_WEBSOCKETS", AUTO_WEBSOCKETS)
+            base = _env_int(self.protocol.warm_env, AUTO_WEBSOCKETS)
             if base == 0:
                 return 0
         return _grown(base, self.peak.get(self.holders)) if self.auto else base
@@ -790,10 +873,10 @@ class WebsocketPool:
                     continue
                 if not isinstance(event, dict):
                     continue
-                kind = event.get("type")
-                if kind in ("session.ready", "session.updated"):
+                kind = self.protocol.kind_of(event)
+                if kind in self.protocol.notes:
                     pooled.note(event)
-                elif kind in ("session.closed", "error"):
+                elif kind in self.protocol.closing:
                     logger.debug(f"Mirai: waiting socket {pooled.session_id}: {kind} {event}")
         except asyncio.CancelledError:
             raise
@@ -821,6 +904,7 @@ class WebsocketPool:
         websocket = None
         try:
             on_edge = await self.edge.open(self._connect, refusals="raise") if self.edge is not None else None
+            protocol = self.protocol
             if on_edge is not None:
                 websocket, event = on_edge.websocket, on_edge.ready
                 pooled = PooledWebsocket(websocket, url=on_edge.url, edge=True)
@@ -831,10 +915,13 @@ class WebsocketPool:
                 websocket = await self._connect(self.url, self.headers, extra)
                 raw = await asyncio.wait_for(websocket.recv(), WS_OPEN_TIMEOUT)
                 event = json.loads(raw) if isinstance(raw, str) else {}
-                if not isinstance(event, dict) or event.get("type") != "session.ready":
-                    detail = event.get("message") if isinstance(event, dict) else None
-                    raise ConnectionError(f"expected session.ready, got {event.get('type')!r}: {detail}")
+                if not isinstance(event, dict) or protocol.kind_of(event) != protocol.ready:
+                    kind = protocol.kind_of(event) if isinstance(event, dict) else None
+                    detail = _event_detail(event) if isinstance(event, dict) else None
+                    raise ConnectionError(f"expected {protocol.ready}, got {kind!r}: {detail}")
                 pooled = PooledWebsocket(websocket, url=self.url)
+            pooled.protocol = protocol
+            pooled.ready = event
             pooled.note(event)
             if self.closed or (not upgrade and len(self.ready) >= self.target()):
                 await _close_quietly(websocket)
@@ -902,7 +989,8 @@ class WebsocketPool:
                     if now - pooled.last_sent >= interval and pooled in self.ready:
                         try:
                             # Changes nothing; any message resets Mirai's idle clock.
-                            await pooled.websocket.send(json.dumps({"type": "session.update"}))
+                            for message in self.protocol.keepalive(pooled.url or self.url):
+                                await pooled.websocket.send(message)
                             pooled.last_sent = time.monotonic()
                         except Exception as exc:
                             logger.debug(f"Mirai: keepalive on a waiting socket failed: {exc!r}")
@@ -979,27 +1067,43 @@ class WebsocketPool:
 
 
 def websocket_pool(
-    url: str, headers: dict[str, str], max_size: int, *, edge: Any = None, create: bool = True
+    url: str,
+    headers: dict[str, str],
+    max_size: int,
+    *,
+    edge: Any = None,
+    create: bool = True,
+    protocol: SocketProtocol = TTS_PROTOCOL,
 ) -> WebsocketPool | None:
     """The running event loop's pool for ``url``, these credentials and this edge route."""
     loop = asyncio.get_running_loop()
-    key = (url, _credential(headers), getattr(edge, "mode", None), id(loop))
+    key = (protocol.service, url, _credential(headers), getattr(edge, "mode", None), id(loop))
     with _lock:
         _purge()
         pool = _ws.get(key)
         if pool is None or pool.closed or pool.loop is not loop:
             if not create:
                 return None
-            pool = _ws[key] = WebsocketPool(url, headers, loop, max_size, edge)
+            pool = _ws[key] = WebsocketPool(url, headers, loop, max_size, edge, protocol)
     return pool
 
 
-async def take_websocket(url: str, headers: dict[str, str], *, edge: Any = None) -> PooledWebsocket | None:
+async def take_websocket(
+    url: str, headers: dict[str, str], *, edge: Any = None, protocol: SocketProtocol = TTS_PROTOCOL
+) -> PooledWebsocket | None:
     """A waiting socket for ``url`` with these credentials, if the running loop's pool has one."""
-    pool = websocket_pool(url, headers, 0, edge=edge, create=False)
+    pool = websocket_pool(url, headers, 0, edge=edge, create=False, protocol=protocol)
     if pool is None:
         return None
     return await pool.take()
+
+
+def _event_detail(event: dict) -> Any:
+    """The message of an error event, flat (``message``) or nested (``error.message``)."""
+    nested = event.get("error")
+    if isinstance(nested, dict):
+        return nested.get("message") or nested.get("code")
+    return event.get("message") or event.get("code")
 
 
 async def _close_quietly(websocket):
@@ -1018,9 +1122,10 @@ def shared_connection_stats() -> dict:
     Returns ``{"http": [...], "websocket": [...]}``: per shared HTTP client its
     ``base_url``, ``warm`` (open, idle) and ``busy`` connections, the
     ``target`` it keeps warm, the ``services`` using it and the ``warmups``
-    sent so far; per WebSocket pool its ``url``, sockets ``ready`` (of
-    which ``edge`` are on Mirai's edge) and ``opening``, ``target``,
-    ``services``, and the sockets ``opened`` and ``handed_out`` so far.
+    sent so far; per WebSocket pool its ``service`` (``"tts"`` or ``"stt"``),
+    ``url``, sockets ``ready`` (of which ``edge`` are on Mirai's edge) and
+    ``opening``, ``target``, ``services``, and the sockets ``opened`` and
+    ``handed_out`` so far.
     """
     loop = asyncio.get_running_loop()
     with _lock:
@@ -1041,6 +1146,7 @@ def shared_connection_stats() -> dict:
         )
     websocket = [
         {
+            "service": p.protocol.service,
             "url": p.url,
             "ready": len(p.ready),
             "edge": sum(w.edge for w in p.ready),

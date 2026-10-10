@@ -4,6 +4,44 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - 2026-10-10
+
+### Added
+
+- **`MiraiSTTService`**: Mirai's streaming speech-to-text for Pipecat, over one
+  WebSocket per pipeline (`/v1/audio/transcriptions/stream`). Partial transcripts
+  come out as `InterimTranscriptionFrame` and each utterance's final as one
+  `TranscriptionFrame`, in order; the TTFB metric is `speech_end` sent to the
+  final, and the usage metric is audio seconds sent.
+  - 8 kHz pipelines send their audio as it is; any other rate is resampled to
+    16 kHz. `encoding` can also be `mulaw` or `alaw`.
+  - `endpointing="auto"` follows your pipeline: with a VAD, its
+    `UserStartedSpeakingFrame` / `UserStoppedSpeakingFrame` become `speech_start`
+    (with 0.5 s of audio from before the VAD fired, so the first word isn't cut)
+    and `speech_end`, and nothing is sent between turns; without one, Mirai's VAD
+    ends the utterances and the service proposes the turn boundaries. Either can
+    be forced.
+  - Language and VAD tuning change on the open socket (`config.update`). A socket
+    that drops is redialled once and the audio Mirai hadn't answered (up to 30 s)
+    is replayed. A session is replaced before its maximum length, at a pause, and
+    when Mirai says it is draining. A fatal error becomes an `ErrorFrame`.
+  - Sockets open on Mirai's STT edge, next to the GPUs, when it is offered, and
+    fall back to the API (`MIRAI_STT_EDGE=off` turns the edge off), and come ready
+    from the process's pool.
+- `prewarm(stt_websockets=…)` keeps STT sockets waiting (2 by default per
+  process once an STT service starts; `MIRAI_WARM_STT_WEBSOCKETS` sets it).
+- `benchmarks/stt-e2e`: N processes x calls streaming 8 kHz audio with utterance
+  boundaries, measuring connect to `session.begin`, `speech_end` to final
+  (p50/p95/p99), partial cadence and missing finals.
+- `examples/foundational/04-transcribe.py`.
+
+### Changed
+
+- Edge routing is per service: `KNOWN_EDGES` is keyed by `(host, service)`,
+  `token_url()` and `EdgeRoute` take a `service` (`"tts"` or `"stt"`), and each
+  service keeps its own edge health, so a dead STT edge doesn't put the TTS edge
+  off. TTS behaviour is unchanged.
+
 ## [0.5.1] - 2026-10-08
 
 ### Fixed

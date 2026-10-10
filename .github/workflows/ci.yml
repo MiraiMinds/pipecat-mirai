@@ -28,4 +28,4 @@ jobs:
       - name: Test
         run: .venv/bin/python -m pytest -q
       - name: Examples compile
-        run: .venv/bin/python -m py_compile examples/foundational/*.py examples/phone/*.py benchmarks/phone-breaks/phone_breaks.py
+        run: .venv/bin/python -m py_compile examples/foundational/*.py examples/phone/*.py benchmarks/phone-breaks/phone_breaks.py benchmarks/stt-e2e/run.py
