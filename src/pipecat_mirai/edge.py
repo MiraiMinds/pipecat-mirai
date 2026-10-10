@@ -4,30 +4,33 @@
 # SPDX-License-Identifier: BSD-2-Clause
 #
 
-"""Streaming TTS from Mirai's edge, next to the speech GPUs.
+"""Streaming TTS and STT from Mirai's edge, next to the GPUs.
 
-Mirai serves the streaming TTS socket from an edge host beside its GPUs as
-well as through its API gateway; the edge reaches the first audio byte in
-about half the time. A socket for Mirai's own gateway opens straight on its
-edge with the API key in the ``Authorization`` header, exactly as on the
-gateway: the edge checks the key with the gateway itself, so there is no extra
-round trip before the first sentence. The gateway is still asked which edge it
-offers (``edge_url`` from ``POST /v2/tts/stream/tokens``), in the background,
-and its answer is remembered for ``EDGE_URL_TTL`` seconds: when the gateway
-stops offering the edge, sockets go back to the gateway. For any other gateway
-the answer is waited for before the first socket (sockets starting together
-share the one request).
+Mirai serves its streaming sockets (TTS ``/v1/audio/speech/stream``, STT
+``/v1/audio/transcriptions/stream``) from an edge host beside its GPUs as well
+as through its API gateway; the edge cuts the time to the first byte. A socket
+for Mirai's own gateway opens straight on its edge with the API key in the
+``Authorization`` header, exactly as on the gateway: the edge checks the key
+with the gateway itself, so there is no extra round trip before the first
+byte. The gateway is still asked which edge it offers (``edge_url`` from
+``POST /v2/tts/stream/tokens`` or ``POST /v2/stt/stream/tokens``), in the
+background, and its answer is remembered for ``EDGE_URL_TTL`` seconds: when
+the gateway stops offering the edge, sockets go back to the gateway. For any
+other gateway the answer is waited for before the first socket (sockets
+starting together share the one request).
 
 Anything that goes wrong on the way leaves the socket to the gateway, exactly
 as before: no edge offered, a gateway without the token route (404/405), an
-edge that refuses the connection or doesn't send ``session.ready`` within
-``EDGE_READY_TIMEOUT``. A failure also keeps sockets off the edge for
-``EDGE_BACKOFF_SECS`` (doubling, up to ``EDGE_MAX_BACKOFF_SECS``), so a dead
-edge doesn't cost every call a timeout; it is logged as a warning once per
-process. After a failure, one socket at a time tries the edge again and the
-others wait for its answer.
+edge that refuses the connection or doesn't send its first event
+(``session.ready`` for TTS, ``session.begin`` for STT) within
+``EDGE_READY_TIMEOUT``. A failure also keeps sockets off that service's edge
+for ``EDGE_BACKOFF_SECS`` (doubling, up to ``EDGE_MAX_BACKOFF_SECS``), so a
+dead edge doesn't cost every call a timeout; it is logged as a warning once
+per process. After a failure, one socket at a time tries the edge again and
+the others wait for its answer. TTS and STT keep separate health.
 
-``MIRAI_TTS_EDGE=off`` turns the automatic edge off for the whole process.
+``MIRAI_TTS_EDGE=off`` (``MIRAI_STT_EDGE=off``) turns the automatic edge off
+for that service in the whole process.
 """
 
 from __future__ import annotations
@@ -45,9 +48,11 @@ from urllib.parse import urlparse
 from loguru import logger
 
 from ._net import websocket_connect_kwargs
-from .pool import shared_http_client
+from .pool import PROTOCOLS, shared_http_client
 
-TOKEN_PATH = "/v2/tts/stream/tokens"
+# Each streaming service's token route, on the gateway that serves its socket.
+TOKEN_PATHS = {"tts": "/v2/tts/stream/tokens", "stt": "/v2/stt/stream/tokens"}
+TOKEN_PATH = TOKEN_PATHS["tts"]
 # The token request and, separately, the edge's connect + handshake + session.ready.
 TOKEN_TIMEOUT = 3.0
 EDGE_READY_TIMEOUT = 3.0
@@ -66,13 +71,18 @@ _lock = threading.Lock()
 _health: dict[tuple[str, str], _Health] = {}
 # (token URL, mode, id(loop)) -> the attempt other sockets are waiting on.
 _probes: dict[tuple[str, str, int], asyncio.Future] = {}
-_warned = False
+# Services whose edge failure has been logged as a warning (once per process each).
+_warned: set[str] = set()
 
-# Mirai's own gateways and the edge next to their speech GPUs. A socket to one
-# of these gateways goes straight to its edge with the API key, while the
-# gateway is asked in the background whether it still offers that edge.
+# Mirai's own gateways and the edges next to their GPUs, per service. A socket
+# to one of these gateways goes straight to its edge with the API key, while
+# the gateway is asked in the background whether it still offers that edge.
 KNOWN_EDGES = {
-    "sandbox.voice.miraiminds.co": "wss://tts-edge.voice.miraiminds.co/v1/audio/speech/stream",
+    ("sandbox.voice.miraiminds.co", "tts"): "wss://tts-edge.voice.miraiminds.co/v1/audio/speech/stream",
+    (
+        "sandbox.voice.miraiminds.co",
+        "stt",
+    ): "wss://stt-edge.voice.miraiminds.co/v1/audio/transcriptions/stream",
 }
 EDGE_URL_TTL = 600.0  # seconds a gateway's answer about its edge is reused
 # token URL -> (edge URL or None, monotonic time to ask again), learned from a gateway.
@@ -117,22 +127,25 @@ _KEY_REFUSALS = {401, 402, 403, 429}
 
 @dataclass
 class EdgeSocket:
-    """A socket open on the edge that has sent ``session.ready``."""
+    """A socket open on the edge that has sent its first event (``session.ready`` / ``session.begin``)."""
 
     websocket: Any
     ready: dict
-    url: str  # the edge's URL (never with the token)
+    url: str  # the edge's URL (never with the key, and without the query)
 
 
 Connect = Callable[[str, dict[str, str], dict[str, Any]], Awaitable[Any]]
 
 
-def edge_mode(edge: bool | str | None) -> str | None:
-    """The ``edge`` option as ``None`` (off), ``"auto"`` or a ``ws(s)://`` URL to force."""
+def edge_mode(edge: bool | str | None, service: str = "tts") -> str | None:
+    """The ``edge`` option as ``None`` (off), ``"auto"`` or a ``ws(s)://`` URL to force.
+
+    ``MIRAI_TTS_EDGE=off`` (``MIRAI_STT_EDGE=off`` for ``service="stt"``) turns ``"auto"`` off.
+    """
     if edge is None or edge is False:
         return None
     if edge is True or edge == "auto":
-        if os.environ.get("MIRAI_TTS_EDGE", "").strip().lower() in _OFF:
+        if os.environ.get(f"MIRAI_{service.upper()}_EDGE", "").strip().lower() in _OFF:
             return None
         return "auto"
     if isinstance(edge, str) and edge.startswith(("ws://", "wss://")):
@@ -140,11 +153,21 @@ def edge_mode(edge: bool | str | None) -> str | None:
     raise ValueError(f"edge must be 'auto', False or a ws:// or wss:// URL; got {edge!r}")
 
 
-def token_url(stream_url: str) -> str:
-    """``wss://host/v1/audio/speech/stream`` -> ``https://host/v2/tts/stream/tokens``."""
+def token_url(stream_url: str, service: str = "tts") -> str:
+    """``wss://host/v1/audio/speech/stream`` -> ``https://host/v2/tts/stream/tokens``.
+
+    ``service="stt"`` gives ``https://host/v2/stt/stream/tokens``.
+    """
     u = urlparse(stream_url)
     scheme = {"wss": "https", "ws": "http"}.get(u.scheme, u.scheme)
-    return f"{scheme}://{u.netloc}{TOKEN_PATH}"
+    return f"{scheme}://{u.netloc}{TOKEN_PATHS[service]}"
+
+
+def _with_query(url: str, query: str) -> str:
+    """``url`` with ``query`` appended (an STT socket's settings travel in its query)."""
+    if not query:
+        return url
+    return f"{url}{'&' if '?' in url else '?'}{query}"
 
 
 def _host(url: str) -> str:
@@ -172,32 +195,40 @@ def _describe(exc: BaseException) -> str:
 
 def _reset():
     """Forget what is known about every edge (tests)."""
-    global _warned
     with _lock:
         _health.clear()
         _probes.clear()
         _edge_urls.clear()
         _asking.clear()
-        _warned = False
+        _warned.clear()
 
 
 class EdgeRoute:
     """How sockets for one streaming URL and API key reach the edge, when they can.
 
     ``url`` is the gateway's streaming endpoint, which also says where tokens
-    come from (the same host). ``headers`` carry the API key, and go to the
-    gateway only. ``mode`` is ``"auto"`` (the edge the gateway names) or an
-    edge URL to use instead. ``http_base`` picks the shared HTTP client
-    (``https://host/v1``), so token requests reuse its warm connections.
+    come from (the same host); its query, if any (an STT socket's settings),
+    goes to the edge too. ``headers`` carry the API key. ``mode`` is
+    ``"auto"`` (the edge the gateway names) or an edge URL to use instead.
+    ``http_base`` picks the shared HTTP client (``https://host/v1``), so
+    token requests reuse its warm connections. ``service`` is ``"tts"`` or
+    ``"stt"``: its token route, the first event its socket sends, and its own
+    health and backoff.
     """
 
-    def __init__(self, url: str, headers: dict[str, str], mode: str, http_base: str):
+    def __init__(self, url: str, headers: dict[str, str], mode: str, http_base: str, service: str = "tts"):
+        if service not in TOKEN_PATHS:
+            raise ValueError(f"service must be one of {', '.join(TOKEN_PATHS)}; got {service!r}")
         self.gateway_url = url
         self.mode = mode
-        self.token_url = token_url(url)
+        self.service = service
+        self.protocol = PROTOCOLS[service]
+        self.token_url = token_url(url, service)
+        self.query = urlparse(url).query
         self._headers = dict(headers)
         self._http_base = http_base
         self._key = (self.token_url, mode)
+        self._label = service.upper()
 
     def _state(self) -> _Health:
         with _lock:
@@ -283,7 +314,9 @@ class EdgeRoute:
                 if refusals == "raise":
                     raise
                 # The key, the wallet or a limit: the gateway says which, and the edge stays in use.
-                logger.debug(f"Mirai: the TTS edge refused this key ({_describe(exc)}); using the gateway")
+                logger.debug(
+                    f"Mirai: the {self._label} edge refused this key ({_describe(exc)}); using the gateway"
+                )
                 return None
             self._failed(f"{_host(url)}: {_describe(exc)}")
             return None
@@ -303,7 +336,7 @@ class EdgeRoute:
             learned = _edge_urls.get(self.token_url)
         if learned is not None and learned[1] > time.monotonic():
             return learned[0]
-        known = KNOWN_EDGES.get(urlparse(self.gateway_url).hostname or "")
+        known = KNOWN_EDGES.get((urlparse(self.gateway_url).hostname or "", self.service))
         if known is None:
             return await asyncio.shield(self._ask())
         self._ask().add_done_callback(_consume)
@@ -373,19 +406,21 @@ class EdgeRoute:
         return None
 
     async def _connect(self, url: str, connect: Connect) -> tuple[Any, dict]:
-        """Open ``url`` with the API key and wait for ``session.ready``, within the time limit.
+        """Open ``url`` with the API key and wait for its first event, within the time limit.
 
         The edge checks the key with the gateway itself, so the client needs no
-        token request of its own: one connection, and the first sentence can go.
+        token request of its own: one connection, and the first byte can go.
         """
         websocket = None
         headers = dict(self._headers)
+        protocol = self.protocol
+        full_url = _with_query(url, self.query)
 
         async def attempt() -> dict:
             nonlocal websocket
-            extra = await websocket_connect_kwargs(url)
+            extra = await websocket_connect_kwargs(full_url)
             try:
-                websocket = await connect(url, headers, extra)
+                websocket = await connect(full_url, headers, extra)
             except BaseException:
                 sock = extra.get("sock")
                 if sock is not None:
@@ -396,10 +431,10 @@ class EdgeRoute:
                 event = json.loads(raw) if isinstance(raw, str) else None
             except ValueError:
                 event = None
-            if not isinstance(event, dict) or event.get("type") != "session.ready":
-                kind = event.get("type") if isinstance(event, dict) else "a message that is not JSON"
-                code = event.get("code") if isinstance(event, dict) else None
-                raise _Failed(f"sent {kind}{f' ({code})' if code else ''} instead of session.ready")
+            if not isinstance(event, dict) or protocol.kind_of(event) != protocol.ready:
+                kind = protocol.kind_of(event) if isinstance(event, dict) else "a message that is not JSON"
+                code = _code(event) if isinstance(event, dict) else None
+                raise _Failed(f"sent {kind}{f' ({code})' if code else ''} instead of {protocol.ready}")
             return event
 
         try:
@@ -418,11 +453,10 @@ class EdgeRoute:
             recovered = state.failures > 0
             state.ok, state.failures, state.retry_at = True, 0, 0.0
         if recovered:
-            logger.info(f"Mirai: the TTS edge {_host(url)} is reachable again; streaming from it")
-        logger.debug(f"Mirai: TTS socket opened on the edge {_host(url)}")
+            logger.info(f"Mirai: the {self._label} edge {_host(url)} is reachable again; streaming from it")
+        logger.debug(f"Mirai: {self._label} socket opened on the edge {_host(url)}")
 
     def _failed(self, reason: str):
-        global _warned
         now = time.monotonic()
         with _lock:
             state = self._state_locked()
@@ -434,13 +468,14 @@ class EdgeRoute:
                 state.failures += 1
                 backoff = min(EDGE_MAX_BACKOFF_SECS, EDGE_BACKOFF_SECS * 2 ** (state.failures - 1))
                 state.retry_at = now + backoff
-            warn, _warned = not _warned, True
+            warn = self.service not in _warned
+            _warned.add(self.service)
         if backoff is None:
-            logger.debug(f"Mirai: TTS edge unavailable: {reason}")
+            logger.debug(f"Mirai: {self._label} edge unavailable: {reason}")
             return
         message = (
-            f"Mirai: the TTS edge is unavailable: {reason}. Streaming through {_host(self.gateway_url)} "
-            f"instead, as before; trying the edge again in {backoff:g} s."
+            f"Mirai: the {self._label} edge is unavailable: {reason}. Streaming through "
+            f"{_host(self.gateway_url)} instead, as before; trying the edge again in {backoff:g} s."
         )
         (logger.warning if warn else logger.debug)(message)
 
@@ -449,13 +484,15 @@ class EdgeRoute:
             state = self._state_locked()
             state.ok, state.failures = False, 0
             state.retry_at = time.monotonic() + NO_EDGE_RECHECK_SECS
-        logger.debug(f"Mirai: no TTS edge ({reason}); streaming through {_host(self.gateway_url)}")
+        logger.debug(f"Mirai: no {self._label} edge ({reason}); streaming through {_host(self.gateway_url)}")
 
     def _busy(self, retry_after: float):
         with _lock:
             state = self._state_locked()
             state.retry_at = max(state.retry_at, time.monotonic() + retry_after)
-        logger.debug("Mirai: the TTS edge token request was rate limited; streaming through the gateway")
+        logger.debug(
+            f"Mirai: the {self._label} edge token request was rate limited; streaming through the gateway"
+        )
 
     def _state_locked(self) -> _Health:
         state = _health.get(self._key)
@@ -467,7 +504,15 @@ class EdgeRoute:
 def _consume(task: asyncio.Task):
     """Retrieve a background question's outcome; nobody is waiting on it."""
     if not task.cancelled() and task.exception() is not None:
-        logger.debug(f"Mirai: couldn't ask the gateway about its TTS edge ({_describe(task.exception())})")
+        logger.debug(f"Mirai: couldn't ask the gateway about its edge ({_describe(task.exception())})")
+
+
+def _code(event: dict) -> Any:
+    """An error event's code, flat (``code``) or nested (``error.code``)."""
+    nested = event.get("error")
+    if isinstance(nested, dict):
+        return nested.get("code")
+    return event.get("code")
 
 
 async def _close_quietly(websocket):

@@ -8,14 +8,24 @@ from dataclasses import dataclass
 
 import pytest
 from fake_mirai_gateway import FakeGateway
+from fake_mirai_stt import FakeMiraiSTT
 from fake_mirai_ws import FakeMiraiWS
 from loguru import logger
 from pipecat.frames.frames import LLMFullResponseEndFrame, LLMFullResponseStartFrame, TextFrame, TTSSpeakFrame
 from pipecat.pipeline.worker import PipelineParams
 from pipecat.tests.utils import SleepFrame, run_test
+from test_stt import call as stt_call
+from test_stt import errors_in as stt_errors
+from test_stt import hz_of, texts, utterance
 from test_tts import TEXT, audio_of, errors_in, tone
 
-from pipecat_mirai import MiraiWebsocketTTSService, close_shared_connections, prewarm, shared_connection_stats
+from pipecat_mirai import (
+    MiraiSTTService,
+    MiraiWebsocketTTSService,
+    close_shared_connections,
+    prewarm,
+    shared_connection_stats,
+)
 from pipecat_mirai import edge as edge_module
 from pipecat_mirai import pool as pool_module
 
@@ -26,6 +36,7 @@ SENTENCES = ["आपका order कल deliver होगा।", "क्या 
 @pytest.fixture(autouse=True)
 async def _edge_on(monkeypatch):
     monkeypatch.delenv("MIRAI_TTS_EDGE", raising=False)  # the default: "auto"
+    monkeypatch.delenv("MIRAI_STT_EDGE", raising=False)
     yield
     await close_shared_connections()
 
@@ -410,6 +421,7 @@ os.environ.pop("MIRAI_TTS_EDGE", None)
 os.environ["MIRAI_WARM_CONNECTIONS"] = "0"
 os.environ["MIRAI_WARM_WEBSOCKETS"] = "3"
 from fake_mirai_gateway import FakeGateway
+from fake_mirai_stt import FakeMiraiSTT
 from fake_mirai_ws import FakeMiraiWS
 from pipecat.frames.frames import TTSSpeakFrame
 from pipecat.pipeline.worker import PipelineParams
@@ -482,7 +494,7 @@ def known_edge(monkeypatch):
     """Make the fake gateway one of Mirai's own: its host has a known edge."""
 
     def known(s: Stack):
-        monkeypatch.setitem(edge_module.KNOWN_EDGES, "127.0.0.1", s.edge_url)
+        monkeypatch.setitem(edge_module.KNOWN_EDGES, ("127.0.0.1", "tts"), s.edge_url)
 
     return known
 
@@ -542,3 +554,146 @@ async def test_a_pool_refused_by_the_edge_backs_off_instead_of_filling_the_gatew
         _, up = await ws_call(tts)
         assert not errors_in(up) and tts.connected_url == s.url
         assert len(s.delhi.handshakes) == 1
+
+
+# --- the second service: streaming STT --------------------------------------------------------
+
+
+@dataclass
+class STTStack:
+    url: str
+    gateway: FakeGateway
+    delhi: FakeMiraiSTT
+    edge: FakeMiraiSTT
+    edge_url: str
+
+
+@asynccontextmanager
+async def stt_stack(*, offer=True, gateway=None, delhi=None, edge=None):
+    """The STT gateway (token route + stream) and an edge that takes the API key."""
+    delhi_stt = FakeMiraiSTT(**(delhi or {}))
+    gw = FakeGateway(delhi_stt, key=KEY, service="stt", **(gateway or {}))
+    edge_stt = FakeMiraiSTT(
+        **{"auth": lambda headers: headers.get("Authorization") == f"Bearer {KEY}", **(edge or {})}
+    )
+    async with edge_stt.serve() as real_edge_url, gw.serve() as url:
+        if offer:
+            gw.edge_url = real_edge_url
+        yield STTStack(url, gw, delhi_stt, edge_stt, real_edge_url)
+
+
+def known_stt_edge(monkeypatch, s: STTStack):
+    monkeypatch.setitem(edge_module.KNOWN_EDGES, ("127.0.0.1", "stt"), s.edge_url)
+
+
+def stt_service(url, **kwargs):
+    return MiraiSTTService(api_key=KEY, url=url, endpointing="manual", **kwargs)
+
+
+def test_each_service_has_its_own_token_route_and_known_edge():
+    assert edge_module.token_url("wss://h/v1/audio/speech/stream") == "https://h/v2/tts/stream/tokens"
+    assert (
+        edge_module.token_url("wss://h/v1/audio/transcriptions/stream?x=1", "stt")
+        == "https://h/v2/stt/stream/tokens"
+    )
+    assert edge_module.token_url("ws://127.0.0.1:1/v1/audio/transcriptions/stream", "stt").startswith(
+        "http://"
+    )
+    sandbox = "sandbox.voice.miraiminds.co"
+    assert edge_module.KNOWN_EDGES[(sandbox, "tts")].startswith("wss://tts-edge.")
+    assert edge_module.KNOWN_EDGES[(sandbox, "stt")] == (
+        "wss://stt-edge.voice.miraiminds.co/v1/audio/transcriptions/stream"
+    )
+
+
+def test_each_service_has_its_own_off_switch(monkeypatch):
+    monkeypatch.setenv("MIRAI_STT_EDGE", "off")
+    assert edge_module.edge_mode("auto", "stt") is None
+    assert edge_module.edge_mode("auto", "tts") == "auto"
+    monkeypatch.delenv("MIRAI_STT_EDGE")
+    monkeypatch.setenv("MIRAI_TTS_EDGE", "0")
+    assert edge_module.edge_mode("auto", "stt") == "auto" and edge_module.edge_mode("auto") is None
+    assert edge_module.edge_mode("wss://e/v1/audio/transcriptions/stream", "stt").startswith("wss://e")
+
+
+async def test_an_offered_stt_edge_takes_the_socket_with_the_key_and_the_settings():
+    async with stt_stack() as s:
+        service = stt_service(s.url, language="gu-IN")
+        down, up = await stt_call(service, utterance(440))
+    assert not stt_errors(up) and [hz_of(t) for t in texts(down)] == [440]
+    (mint,) = s.gateway.mints
+    assert mint["path"].split("?")[0] == "/v2/stt/stream/tokens" and bearer(mint) == f"Bearer {KEY}"
+    (handshake,) = s.edge.handshakes
+    assert KEY not in handshake["path"] and bearer(handshake) == f"Bearer {KEY}"
+    # The settings that fix the stream travel to the edge in the query, as on the gateway.
+    assert handshake["query"] == {
+        "model": "mira-stt",
+        "encoding": "linear16",
+        "sample_rate": "8000",
+        "endpointing": "manual",
+        "language_code": "gu-IN",
+    }
+    assert s.delhi.handshakes == [] and service.connected_url == s.edge_url
+
+
+async def test_mirais_own_stt_gateway_goes_straight_to_its_edge(monkeypatch):
+    async with stt_stack(gateway={"token_delay": 2.0}) as s:
+        known_stt_edge(monkeypatch, s)
+        service = stt_service(s.url)
+        started = time.monotonic()
+        down, up = await stt_call(service, utterance(440))
+        assert time.monotonic() - started < 1.5
+        assert not stt_errors(up) and service.connected_url == s.edge_url and s.delhi.handshakes == []
+        await asyncio.sleep(2.2)
+        assert len(s.gateway.mints) == 1  # asked, in the background, once
+
+
+async def test_a_dead_stt_edge_leaves_the_call_to_the_gateway_and_tts_unaffected(monkeypatch, edge_warnings):
+    async with stt_stack() as s:
+        s.gateway.edge_url = closed_port_url().replace("/speech/", "/transcriptions/")
+        service = stt_service(s.url)
+        down, up = await stt_call(service, utterance(440))
+        assert not stt_errors(up) and [hz_of(t) for t in texts(down)] == [440]
+        assert service.connected_url == s.url and len(s.delhi.handshakes) == 1
+        (warning,) = edge_warnings()
+        assert "STT edge is unavailable" in warning
+        # The failure is the STT edge's: the TTS edge of the same host keeps its own good name.
+        states = {key: state.ok for key, state in edge_module._health.items()}
+        assert any(key[0].endswith("/v2/stt/stream/tokens") and not ok for key, ok in states.items())
+        assert not any(key[0].endswith("/v2/tts/stream/tokens") and not ok for key, ok in states.items())
+
+
+async def test_a_gateway_without_the_stt_token_route_is_used_directly():
+    async with stt_stack(gateway={"token_status": 404}) as s:
+        service = stt_service(s.url)
+        _, up = await stt_call(service, utterance(440))
+        assert not stt_errors(up) and service.connected_url == s.url and s.edge.handshakes == []
+
+
+async def test_a_refused_key_at_the_stt_edge_goes_to_the_gateway(monkeypatch, edge_warnings):
+    async with stt_stack(edge={"auth": lambda headers: False}) as s:
+        known_stt_edge(monkeypatch, s)
+        service = stt_service(s.url)
+        _, up = await stt_call(service, utterance(440))
+        assert service.connected_url == s.url and len(s.delhi.handshakes) == 1 and edge_warnings() == []
+
+
+async def test_the_stt_edge_off_switch_keeps_sockets_on_the_gateway(monkeypatch):
+    monkeypatch.setenv("MIRAI_STT_EDGE", "off")
+    async with stt_stack() as s:
+        service = stt_service(s.url)
+        _, up = await stt_call(service, utterance(440))
+        assert not stt_errors(up) and service.connected_url == s.url
+        assert s.gateway.mints == [] and s.edge.handshakes == []
+
+
+async def test_waiting_stt_sockets_open_on_the_edge(monkeypatch):
+    async with stt_stack() as s:
+        known_stt_edge(monkeypatch, s)
+        result = await prewarm(api_key=KEY, connections=0, websocket=0, stt_websockets=2, stt_url=s.url)
+        assert (result.stt_websockets, result.errors) == (2, [])
+        assert len(s.edge.conns) == 2 and s.delhi.handshakes == []
+        service = stt_service(s.url)
+        down, up = await stt_call(service, utterance(440))
+        assert not stt_errors(up) and service.connected_url == s.edge_url
+        assert [hz_of(t) for t in texts(down)] == [440] and any(c.utterances for c in s.edge.conns[:2])
