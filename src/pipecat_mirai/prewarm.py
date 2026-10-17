@@ -15,7 +15,10 @@ from dataclasses import dataclass, field
 from loguru import logger
 
 from pipecat_mirai.edge import EdgeRoute, edge_mode
-from pipecat_mirai.pool import shared_http_client, websocket_pool
+from pipecat_mirai.pool import STT_PROTOCOL, shared_http_client, websocket_pool
+from pipecat_mirai.stt import MAX_MESSAGE_BYTES as STT_MAX_MESSAGE_BYTES
+from pipecat_mirai.stt import WIRE_SAMPLE_RATES, pool_url
+from pipecat_mirai.stt import _http_base as _stt_http_base
 from pipecat_mirai.tts import DEFAULT_BASE_URL
 from pipecat_mirai.tts_websocket import MAX_MESSAGE_BYTES, _http_base
 
@@ -26,14 +29,16 @@ class PrewarmResult:
 
     Parameters:
         http_connections: Idle keep-alive HTTP connections open to ``base_url``.
-        websockets: Pre-authenticated sockets waiting for a pipeline.
+        websockets: Pre-authenticated TTS sockets waiting for a pipeline.
         errors: What failed, if anything. The pools keep trying in the
             background either way.
+        stt_websockets: Pre-authenticated STT sockets waiting for a pipeline.
     """
 
     http_connections: int = 0
     websockets: int = 0
     errors: list[str] = field(default_factory=list)
+    stt_websockets: int = 0
 
 
 async def prewarm(
@@ -45,6 +50,10 @@ async def prewarm(
     websocket_url: str | None = None,
     edge: bool | str = "auto",
     timeout: float = 10.0,
+    stt_websockets: int = 0,
+    stt_url: str | None = None,
+    stt_sample_rate: int = 8000,
+    stt_endpointing: str = "manual",
 ) -> PrewarmResult:
     """Open connections to Mirai now, for every pipeline this event loop runs later.
 
@@ -67,6 +76,12 @@ async def prewarm(
       in the background. A socket serves one pipeline and is closed when it
       ends. Sockets open on Mirai's edge when it is available, as the
       service's own do.
+    - ``stt_websockets`` sockets to the streaming STT endpoint are opened and
+      left waiting at ``session.begin`` (a ping and 40 ms of silence every
+      20 s). A :class:`~pipecat_mirai.MiraiSTTService` takes one when its
+      pipeline starts if its fixed settings match (``stt_sample_rate``,
+      ``stt_endpointing``, the default model and linear16), and moves it to
+      its own language with ``config.update`` if that differs.
 
     Calling it again changes the numbers; ``0`` stops keeping that kind open.
     Network failures are logged and returned in :attr:`PrewarmResult.errors`,
@@ -85,6 +100,14 @@ async def prewarm(
             ``False`` or an edge URL); waiting sockets go only to services
             with the same setting.
         timeout: Seconds to wait for the connections to open.
+        stt_websockets: STT sockets to keep waiting (0 to 64).
+        stt_url: The STT streaming endpoint, as given to ``MiraiSTTService``
+            as ``url``. Defaults to ``base_url`` with ``wss://`` and
+            ``/audio/transcriptions/stream``.
+        stt_sample_rate: The rate the services that take these sockets send
+            at: 8000 (phone pipelines, the default) or 16000.
+        stt_endpointing: ``"manual"`` (the pipeline has a VAD; the default)
+            or ``"vad"``, as the services resolve it.
 
     Returns:
         How many connections and sockets are open, and any errors.
@@ -96,6 +119,12 @@ async def prewarm(
         raise ValueError(f"connections must be an int from 0 to 64; got {connections!r}")
     if type(websocket) is not int or not 0 <= websocket <= 64:
         raise ValueError(f"websocket must be an int from 0 to 64; got {websocket!r}")
+    if type(stt_websockets) is not int or not 0 <= stt_websockets <= 64:
+        raise ValueError(f"stt_websockets must be an int from 0 to 64; got {stt_websockets!r}")
+    if stt_sample_rate not in WIRE_SAMPLE_RATES:
+        raise ValueError(f"stt_sample_rate must be 8000 or 16000; got {stt_sample_rate!r}")
+    if stt_endpointing not in ("manual", "vad"):
+        raise ValueError(f"stt_endpointing must be 'manual' or 'vad'; got {stt_endpointing!r}")
     if not timeout > 0:
         raise ValueError(f"timeout must be > 0; got {timeout!r}")
     base = base_url.rstrip("/")
@@ -105,6 +134,14 @@ async def prewarm(
     headers = {"Authorization": f"Bearer {key}"}
     mode = edge_mode(edge)
     route = EdgeRoute(ws_url, headers, mode, _http_base(ws_url)) if mode else None
+    stt_base = (stt_url or _websocket_url(base, "/audio/transcriptions/stream")).rstrip("/")
+    if not stt_base.startswith(("ws://", "wss://")):
+        raise ValueError(f"stt_url must be a ws:// or wss:// URL; got {stt_base!r}")
+    stt_pool_url = pool_url(stt_base, sample_rate=stt_sample_rate, endpointing=stt_endpointing)
+    stt_mode = edge_mode(edge, "stt")
+    stt_route = (
+        EdgeRoute(stt_pool_url, headers, stt_mode, _stt_http_base(stt_base), "stt") if stt_mode else None
+    )
 
     result = PrewarmResult()
 
@@ -128,17 +165,35 @@ async def prewarm(
             if result.websockets < websocket and pool.last_error:
                 result.errors.append(f"WebSocket {ws_url}: {pool.last_error}")
 
-    await asyncio.gather(http(), ws())
+    async def stt():
+        pool = websocket_pool(
+            stt_pool_url,
+            headers,
+            STT_MAX_MESSAGE_BYTES,
+            edge=stt_route,
+            create=stt_websockets > 0,
+            protocol=STT_PROTOCOL,
+        )
+        if pool is None:
+            return
+        pool.set_floor(stt_websockets)
+        if stt_websockets:
+            result.stt_websockets = await pool.wait_ready(stt_websockets, timeout)
+            if result.stt_websockets < stt_websockets and pool.last_error:
+                result.errors.append(f"WebSocket {stt_base}: {pool.last_error}")
+
+    await asyncio.gather(http(), ws(), stt())
     logger.debug(
         f"Mirai prewarm: {result.http_connections}/{connections} HTTP connections to {base}, "
-        f"{result.websockets}/{websocket} sockets to {ws_url}"
+        f"{result.websockets}/{websocket} sockets to {ws_url}, "
+        f"{result.stt_websockets}/{stt_websockets} sockets to {stt_base}"
     )
     return result
 
 
-def _websocket_url(base: str) -> str:
-    """``https://host/v1`` -> ``wss://host/v1/audio/speech/stream``."""
+def _websocket_url(base: str, path: str = "/audio/speech/stream") -> str:
+    """``https://host/v1`` -> ``wss://host/v1/audio/speech/stream`` (or another ``path``)."""
     for http, ws in (("https://", "wss://"), ("http://", "ws://")):
         if base.startswith(http):
-            return ws + base[len(http) :] + "/audio/speech/stream"
-    return base + "/audio/speech/stream"
+            return ws + base[len(http) :] + path
+    return base + path

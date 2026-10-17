@@ -4,6 +4,63 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - Unreleased
+
+Not on PyPI yet: it is published once Mirai's streaming speech-to-text API is
+live.
+
+### Added
+
+- **`MiraiSTTService`**: Mirai's streaming speech-to-text for Pipecat, over one
+  WebSocket per pipeline (`/v1/audio/transcriptions/stream`, with the API key in
+  the `Authorization` header). Partial transcripts come out as
+  `InterimTranscriptionFrame` and each utterance's final as one
+  `TranscriptionFrame`, in order; the TTFB metric is `speech_end` sent to the
+  final, and the usage metric is audio seconds sent.
+  - Ten languages: `hi-IN` (the default; Hindi and Hinglish), `en-IN`, `gu-IN`,
+    `mr-IN`, `pa-IN`, `bn-IN`, `ta-IN`, `te-IN`, `kn-IN` and `ml-IN`
+    (`STT_LANGUAGES`). Any case, the bare code (`"gu"`) or a Pipecat `Language`
+    is taken and sent as Mirai's code. There is no language detection: `"auto"`,
+    `"unknown"` or a language outside the list raises `ValueError` when the
+    service is created, with the list in the message. A settings update to one
+    is not sent (the socket keeps its language) and is logged as a warning.
+  - 8 kHz pipelines send their audio as it is; any other rate is resampled to
+    16 kHz. `encoding` can also be `mulaw` or `alaw`.
+  - `endpointing="auto"` follows your pipeline: with a VAD, its
+    `UserStartedSpeakingFrame` / `UserStoppedSpeakingFrame` become `speech_start`
+    (with 0.5 s of audio from before the VAD fired, so the first word isn't cut)
+    and `speech_end`, and nothing is sent between turns; without one, Mirai's VAD
+    ends the utterances and the service proposes the turn boundaries. Either can
+    be forced.
+  - Language and VAD tuning change on the open socket (`config.update`). A socket
+    that drops is redialled once and the audio Mirai hadn't answered (up to 30 s)
+    is replayed. A session is replaced before its maximum length, at a pause, and
+    when Mirai says it is draining. A fatal error becomes an `ErrorFrame`.
+  - Sockets open on Mirai's API, which serves speech-to-text next to the GPUs,
+    and come ready from the process's pool. There is no STT edge: with
+    `edge="auto"` the socket opens on the API at once, with no edge tried and
+    nothing waited for. The API is asked in the background whether it offers
+    one (at most once a minute per process, and its answer is kept for 10
+    minutes), so an edge it names later is used without an upgrade.
+  - `audio_seconds_billed` and `cost_paise` add up what Mirai billed, from each
+    session's `session.end`.
+- `prewarm(stt_websockets=…)` keeps STT sockets waiting (2 by default per
+  process once an STT service starts; `MIRAI_WARM_STT_WEBSOCKETS` sets it).
+- STT benchmark, `benchmarks/stt-e2e`: N processes x calls streaming 8 kHz audio
+  at real time with utterance boundaries, synthetic or recorded, measuring
+  connect to `session.begin`, `speech_end` to final (p50/p95/p99), partial
+  cadence and missing finals, with pass/fail flags. Its numbers against the live
+  API come with the release.
+- `examples/foundational/04-transcribe.py`.
+
+### Changed
+
+- Edge routing is per service: `KNOWN_EDGES` is keyed by `(host, service)`,
+  `token_url()` and `EdgeRoute` take a `service` (`"tts"` or `"stt"`), and each
+  service keeps its own edge health, so a failing STT edge doesn't put the TTS
+  edge off. A `KNOWN_EDGES` entry of `None` is one of Mirai's gateways that
+  offers no edge: sockets open on it straight away. TTS behaviour is unchanged.
+
 ## [0.5.1] - 2026-10-08
 
 ### Fixed

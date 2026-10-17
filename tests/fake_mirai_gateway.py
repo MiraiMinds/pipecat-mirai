@@ -7,6 +7,7 @@ edge is a second ``FakeMiraiWS`` whose ``auth`` is :meth:`FakeGateway.spend`:
 it accepts only tokens this gateway issued, each once.
 
 Knobs: ``edge_url`` (what the token answer names; ``None`` offers no edge),
+``service`` ("tts" or "stt": which token route and stream path it serves),
 ``edge_field`` (False: answer without the ``edge_url`` field, as today's
 gateway does), ``token_status`` (e.g. 404 for a gateway without the route, or
 503) and ``token_delay`` (seconds before answering).
@@ -24,6 +25,10 @@ from http import HTTPStatus
 from urllib.parse import urlparse
 
 TOKEN_PATH = "/v2/tts/stream/tokens"
+SERVICES = {
+    "tts": (TOKEN_PATH, "/v1/audio/speech/stream", "tts_stream_token"),
+    "stt": ("/v2/stt/stream/tokens", "/v1/audio/transcriptions/stream", "stt_stream_token"),
+}
 
 
 class FakeGateway:
@@ -37,7 +42,9 @@ class FakeGateway:
         token_status=201,
         token_delay=0.0,
         batch=False,
+        service="tts",
     ):
+        self.token_path, self.stream_path, self.token_object = SERVICES[service]
         self.stream = stream  # the FakeMiraiWS behind the gateway's streaming endpoint
         self.key = key
         self.edge_url = edge_url
@@ -72,7 +79,7 @@ class FakeGateway:
             await asyncio.sleep(self.token_delay)
         if headers.get("authorization") != f"Bearer {self.key}":
             status, body = 401, {"error": {"code": "unauthorized", "message": "invalid API key"}}
-        elif path.split("?", 1)[0] != TOKEN_PATH or self.token_status == 404:
+        elif path.split("?", 1)[0] != self.token_path or self.token_status == 404:
             status, body = 404, {"error": {"code": "not_found", "message": "not found"}}
         elif self.token_status not in (200, 201):
             status, body = self.token_status, {"error": {"code": "unavailable", "message": "try again"}}
@@ -88,7 +95,7 @@ class FakeGateway:
             for t in batch:
                 self.issued[t] = False
             status = self.token_status
-            body = {"object": "tts_stream_token", "token": token, "expires_at": int(time.time()) + 60}
+            body = {"object": self.token_object, "token": token, "expires_at": int(time.time()) + 60}
             if self.batch:
                 body["tokens"] = batch
             if self.edge_field:
@@ -156,7 +163,7 @@ class FakeGateway:
             server = await asyncio.start_server(handle, "127.0.0.1", 0)
             port = server.sockets[0].getsockname()[1]
             try:
-                yield f"ws://127.0.0.1:{port}/v1/audio/speech/stream"
+                yield f"ws://127.0.0.1:{port}{self.stream_path}"
             finally:
                 server.close()
                 for w in writers:
