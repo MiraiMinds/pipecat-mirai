@@ -601,9 +601,8 @@ def test_each_service_has_its_own_token_route_and_known_edge():
     )
     sandbox = "sandbox.voice.miraiminds.co"
     assert edge_module.KNOWN_EDGES[(sandbox, "tts")].startswith("wss://tts-edge.")
-    assert edge_module.KNOWN_EDGES[(sandbox, "stt")] == (
-        "wss://stt-edge.voice.miraiminds.co/v1/audio/transcriptions/stream"
-    )
+    # Mirai's own gateway, with no STT edge: sockets open on the gateway without trying one.
+    assert (sandbox, "stt") in edge_module.KNOWN_EDGES and edge_module.KNOWN_EDGES[(sandbox, "stt")] is None
 
 
 def test_each_service_has_its_own_off_switch(monkeypatch):
@@ -634,6 +633,73 @@ async def test_an_offered_stt_edge_takes_the_socket_with_the_key_and_the_setting
         "language_code": "gu-IN",
     }
     assert s.delhi.handshakes == [] and service.connected_url == s.edge_url
+
+
+async def test_mirais_own_stt_gateway_without_an_edge_is_used_at_once_and_asked_once(
+    monkeypatch, edge_warnings
+):
+    # Today's sandbox: Mirai's own gateway (known), no STT edge, and a token route
+    # that answers `edge_url: null` (here slowly). No call tries an edge or waits.
+    async with stt_stack(offer=False, gateway={"token_delay": 1.0}) as s:
+        monkeypatch.setitem(edge_module.KNOWN_EDGES, ("127.0.0.1", "stt"), None)
+        service = stt_service(s.url)
+        started = time.monotonic()
+        down, up = await stt_call(service, utterance(440))
+        assert time.monotonic() - started < 1.0  # the call didn't wait for the token route
+        assert not stt_errors(up) and [hz_of(t) for t in texts(down)] == [440]
+        assert service.connected_url == s.url and s.edge.handshakes == [] and s.edge.conns == []
+        await asyncio.sleep(1.2)
+        assert len(s.gateway.mints) == 1  # asked, in the background, once
+        for hz in (660, 880):
+            forget_backoff()  # even with nothing holding it back, nobody asks again or probes
+            service = stt_service(s.url)
+            down, up = await stt_call(service, utterance(hz))
+            assert not stt_errors(up) and [hz_of(t) for t in texts(down)] == [hz]
+            assert service.connected_url == s.url
+        assert len(s.gateway.mints) == 1 and s.edge.handshakes == [] and len(s.delhi.handshakes) == 3
+    assert edge_warnings() == []
+
+
+async def test_a_gateway_offering_no_stt_edge_is_asked_once_per_ttl_not_per_session(edge_warnings):
+    # Another gateway (not one of Mirai's known ones) whose token route says `edge_url: null`.
+    async with stt_stack(offer=False) as s:
+        for hz in (440, 660, 880):
+            forget_backoff()
+            service = stt_service(s.url)
+            down, up = await stt_call(service, utterance(hz))
+            assert not stt_errors(up) and [hz_of(t) for t in texts(down)] == [hz]
+            assert service.connected_url == s.url
+        assert len(s.gateway.mints) == 1 and s.edge.handshakes == [] and len(s.delhi.handshakes) == 3
+        # Once the answer is old, it is asked again (and, still no edge, the socket stays on the gateway).
+        for token_url, (edge_url, _) in list(edge_module._edge_urls.items()):
+            edge_module._edge_urls[token_url] = (edge_url, 0.0)
+        forget_backoff()
+        _, up = await stt_call(stt_service(s.url), utterance(440))
+        assert not stt_errors(up) and len(s.gateway.mints) == 2 and s.edge.handshakes == []
+    assert edge_warnings() == []
+
+
+async def test_the_stt_edge_is_used_once_the_gateway_offers_one(monkeypatch):
+    # The day an STT edge comes back: the gateway starts naming it, and new sockets go there.
+    async with stt_stack(offer=False) as s:
+        monkeypatch.setitem(edge_module.KNOWN_EDGES, ("127.0.0.1", "stt"), None)
+        first = stt_service(s.url)
+        _, up = await stt_call(first, utterance(440))
+        assert not stt_errors(up) and first.connected_url == s.url
+        await asyncio.sleep(0.2)  # the background answer (no edge) is in
+        s.gateway.edge_url = s.edge_url
+        for token_url in list(edge_module._edge_urls):
+            edge_module._edge_urls[token_url] = (None, 0.0)  # that answer is old now
+        forget_backoff()
+        second = stt_service(s.url)
+        _, up = await stt_call(second, utterance(660))  # asks again, in the background
+        assert not stt_errors(up) and second.connected_url == s.url
+        await asyncio.sleep(0.2)
+        forget_backoff()
+        third = stt_service(s.url)
+        down, up = await stt_call(third, utterance(880))
+        assert not stt_errors(up) and third.connected_url == s.edge_url
+        assert [hz_of(t) for t in texts(down)] == [880] and len(s.edge.handshakes) == 1
 
 
 async def test_mirais_own_stt_gateway_goes_straight_to_its_edge(monkeypatch):

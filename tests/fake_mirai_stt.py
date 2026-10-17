@@ -1,9 +1,11 @@
 """A fake of Mirai's streaming STT socket (``/v1/audio/transcriptions/stream``), for tests.
 
 It implements the protocol from the server's side, as Mirai's STT gateway
-speaks it (Sarvam-v3 compatible). The query (``language_code``, ``model``,
+speaks it. The query (``language_code``, ``model``,
 ``encoding``, ``sample_rate``, ``endpointing``, tuning) is validated before the
-upgrade: an unknown parameter is a 400 ``invalid_config``. Then
+upgrade: an unknown parameter, or a ``language_code`` not spelled as one of
+the ten codes, is a 400 ``invalid_config`` (a ``config.update`` to such a
+language is a fatal ``invalid_config`` error). Then
 ``session.begin`` {request_id, session_id, config, capabilities, limits}, and:
 
 - ``audio_input``: audio is decoded (linear16, mulaw or alaw) and kept.
@@ -68,6 +70,8 @@ ALLOWED = {
     "min_speech_duration_ms",
     "token",
 }
+# The codes the socket takes (the client sends them spelled exactly so).
+LANGUAGES = ("hi-IN", "en-IN", "gu-IN", "mr-IN", "pa-IN", "bn-IN", "ta-IN", "te-IN", "kn-IN", "ml-IN")
 VAD_FRAME_SECS = 0.02
 VAD_RMS = 300.0
 
@@ -217,6 +221,8 @@ class FakeMiraiSTT:
                 return _refusal(400, "invalid_config", f"unknown parameter {unknown[0]!r}")
             if query.get("sample_rate", "16000") not in ("8000", "16000"):
                 return _refusal(400, "invalid_config", "sample_rate must be 8000 or 16000")
+            if query.get("language_code", "hi-IN") not in LANGUAGES:
+                return _refusal(400, "invalid_config", f"language_code must be one of {', '.join(LANGUAGES)}")
             if self.capacity is not None and self.active >= self.capacity:
                 return _refusal(429, "at_capacity", "STT is at capacity", retry_after=True)
             return None
@@ -291,6 +297,19 @@ class FakeMiraiSTT:
                 self._close(conn)
         elif kind == "config.update":
             fields = {k: v for k, v in event.items() if k != "event"}
+            if fields.get("language_code", conn.language) not in LANGUAGES:
+                # As the engine answers it: fatal, and the socket closes.
+                await self._send(
+                    conn,
+                    {
+                        "event": "error",
+                        "code": "invalid_config",
+                        "message": "language_code",
+                        "is_fatal": True,
+                    },
+                )
+                await conn.ws.close(4000, "invalid_config")
+                return
             conn.language = fields.get("language_code", conn.language)
             await self._send(conn, {"event": "config.updated", "config": fields})
         elif kind == "ping":

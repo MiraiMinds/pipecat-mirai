@@ -25,8 +25,10 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams
 from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.tests.utils import SleepFrame, run_test
+from pipecat.transcriptions.language import Language
 from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies
 
+import pipecat_mirai
 from pipecat_mirai import MiraiSTTService, MiraiSTTSettings, close_shared_connections, prewarm
 from pipecat_mirai import stt as stt_module
 from pipecat_mirai.stt import lin2alaw, lin2ulaw
@@ -564,15 +566,109 @@ def test_an_api_key_is_required(monkeypatch):
 
 
 def test_languages_are_mirais_codes():
-    from pipecat.transcriptions.language import Language
-
-    service = MiraiSTTService(api_key=KEY, language=Language.GU)
-    assert service._settings.language == "gu-IN"
     assert MiraiSTTService(api_key=KEY)._settings.language == "hi-IN"
     assert (
         MiraiSTTService(api_key=KEY, settings=MiraiSTTSettings(language="ta-IN"))._settings.language
         == "ta-IN"
     )
+    assert stt_module.STT_LANGUAGES == pipecat_mirai.STT_LANGUAGES
+    assert pipecat_mirai.STT_LANGUAGES == (
+        "hi-IN",
+        "en-IN",
+        "gu-IN",
+        "mr-IN",
+        "pa-IN",
+        "bn-IN",
+        "ta-IN",
+        "te-IN",
+        "kn-IN",
+        "ml-IN",
+    )
+
+
+@pytest.mark.parametrize(
+    "given, code",
+    [
+        ("gu-IN", "gu-IN"),
+        ("gu-in", "gu-IN"),
+        ("GU-IN", "gu-IN"),
+        ("gu", "gu-IN"),
+        ("GU", "gu-IN"),
+        (" ta ", "ta-IN"),
+        ("en", "en-IN"),
+        (Language.GU, "gu-IN"),
+        (Language.GU_IN, "gu-IN"),
+        (Language.HI, "hi-IN"),
+        (Language.ML_IN, "ml-IN"),
+    ],
+)
+def test_a_language_is_taken_in_any_case_or_as_the_bare_code(given, code):
+    assert stt_module.stt_language(given) == code
+    assert MiraiSTTService(api_key=KEY, language=given)._settings.language == code
+    assert MiraiSTTService(api_key=KEY, settings=MiraiSTTSettings(language=given))._settings.language == code
+
+
+@pytest.mark.parametrize("given", ["en-US", "fr", "or-IN", "as", "hindi", "xx-IN", "", None, Language.EN_US])
+def test_a_language_mirai_does_not_transcribe_is_refused(given):
+    with pytest.raises(ValueError, match="must be one of hi-IN, en-IN, gu-IN.*ml-IN"):
+        MiraiSTTService(api_key=KEY, language=given)
+    with pytest.raises(ValueError):
+        MiraiSTTService(api_key=KEY, settings=MiraiSTTSettings(language=given))
+
+
+@pytest.mark.parametrize("given", ["auto", "AUTO", "unknown", "multi"])
+def test_auto_is_refused_because_there_is_no_language_detection(given):
+    with pytest.raises(ValueError, match="no language detection") as refused:
+        MiraiSTTService(api_key=KEY, language=given)
+    assert "gu-IN" in str(refused.value)
+
+
+async def test_a_bare_code_goes_on_the_socket_as_mirais_code():
+    fake = FakeMiraiSTT()
+    async with fake.serve() as url:
+        down, up = await call(stt(url, endpointing="manual", language="gu"), utterance(440))
+    assert not errors_in(up)
+    (conn,) = fake.conns
+    assert conn.query["language_code"] == "gu-IN"
+    assert [f.language.value for f in finals(down)] == ["gu-IN"]
+
+
+async def test_a_language_update_is_normalised_and_an_unsupported_one_is_not_sent(logs):
+    fake = FakeMiraiSTT()
+    async with fake.serve() as url:
+        down, up = await call(
+            stt(url, endpointing="manual"),
+            [
+                *utterance(440),
+                SleepFrame(0.2),
+                STTUpdateSettingsFrame(delta=MiraiSTTSettings(language="auto")),
+                SleepFrame(0.1),
+                *utterance(660),
+                SleepFrame(0.3),
+                STTUpdateSettingsFrame(delta=MiraiSTTSettings(language=Language.TA)),
+                SleepFrame(0.1),
+                *utterance(880),
+            ],
+        )
+    assert not errors_in(up)
+    (conn,) = fake.conns
+    # "auto" never reaches the socket: it keeps its language. Language.TA goes as ta-IN.
+    assert conn.events("config.update") == [{"event": "config.update", "language_code": "ta-IN"}]
+    assert [f.language.value for f in finals(down)] == ["hi-IN", "hi-IN", "ta-IN"]
+    assert any(
+        level == "WARNING" and "no language detection" in m and "keeping hi-IN" in m for level, m in logs
+    )
+
+
+async def test_what_mirai_billed_is_summed_from_session_end():
+    fake = FakeMiraiSTT()
+    async with fake.serve() as url:
+        service = stt(url, endpointing="manual")
+        _, up = await call(service, [*utterance(440), *utterance(880)])
+    assert not errors_in(up)
+    (conn,) = fake.conns
+    assert conn.events("end")
+    assert service.audio_seconds_billed >= 1 and service.cost_paise == 1
 
 
 def test_the_key_is_never_in_the_url():

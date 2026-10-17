@@ -7,18 +7,19 @@
 """Mirai speech-to-text over one WebSocket per pipeline.
 
 ``MiraiSTTService`` streams the caller's audio to Mirai's
-``/v1/audio/transcriptions/stream`` and turns what comes back into Pipecat
-transcription frames. The protocol is Mirai's STT gateway's, which is
-Sarvam-v3 compatible. Client: ``audio_input`` {audio: base64}, ``speech_start``
-/ ``speech_end`` / ``flush`` (manual endpointing), ``config.update``, ``ping``,
-``end``. Server: ``session.begin`` (request id, session id, limits),
-``vad.speech_start`` / ``vad.speech_end`` (server endpointing),
-``transcript.partial`` (a full snapshot of the utterance so far),
+``/v1/audio/transcriptions/stream`` (``Authorization: Bearer`` with the API
+key) and turns what comes back into Pipecat transcription frames.
+
+The wire protocol, in short. Client: ``audio_input`` {audio: base64},
+``speech_start`` / ``speech_end`` / ``flush`` (manual endpointing),
+``config.update``, ``ping``, ``end``. Server: ``session.begin`` (request id,
+session id, limits), ``vad.speech_start`` / ``vad.speech_end`` (server
+endpointing), ``transcript.partial`` (a full snapshot of the utterance so far),
 ``transcript.final`` (exactly one per utterance, in order), ``config.updated``,
-``pong``, ``session.draining``, ``session.end`` and ``error`` {code, message,
-is_fatal}. Settings that fix the stream (model, encoding, rate, endpointing)
-travel in the connection's query string; language and tuning can change on an
-open socket with ``config.update``.
+``pong``, ``session.draining``, ``session.end`` (audio seconds billed, cost in
+paise) and ``error`` {code, message, is_fatal}. Settings that fix the stream
+(model, encoding, rate, endpointing) travel in the connection's query string;
+language and tuning can change on an open socket with ``config.update``.
 """
 
 from __future__ import annotations
@@ -70,8 +71,10 @@ from pipecat_mirai.pool import STT_PROTOCOL, WebsocketPool, _retry_after, take_w
 DEFAULT_STT_WEBSOCKET_URL = "wss://sandbox.voice.miraiminds.co/v1/audio/transcriptions/stream"
 DEFAULT_LANGUAGE = "hi-IN"
 DEFAULT_MODEL = "mira-stt"
-# The languages Mirai's streaming STT accepts (``language_code``).
+#: The languages Mirai's speech-to-text transcribes (``language_code`` on the socket).
 STT_LANGUAGES = ("hi-IN", "en-IN", "gu-IN", "mr-IN", "pa-IN", "bn-IN", "ta-IN", "te-IN", "kn-IN", "ml-IN")
+# Asks for language detection, which Mirai's speech-to-text doesn't do.
+_DETECT = frozenset({"auto", "unknown", "detect", "multi", "multilingual"})
 # The rates and encodings the socket takes.
 WIRE_SAMPLE_RATES = (8000, 16000)
 ENCODINGS = ("linear16", "mulaw", "alaw")
@@ -169,6 +172,30 @@ _ADVICE = {
 }
 
 
+def stt_language(language: str | Language) -> str:
+    """The language code Mirai's speech-to-text takes for ``language``, or a ``ValueError``.
+
+    One of :data:`STT_LANGUAGES` in any case (``"gu-in"``), the bare language
+    (``"gu"``) or a Pipecat ``Language`` (``Language.GU``, ``Language.GU_IN``)
+    all give ``"gu-IN"``. There is no language detection: ``"auto"`` and
+    ``"unknown"`` are refused, as are languages outside the list.
+    """
+    code = str(getattr(language, "value", language) or "").strip()
+    lowered = code.lower()
+    for supported in STT_LANGUAGES:
+        if lowered in (supported.lower(), supported.split("-", 1)[0]):
+            return supported
+    if lowered in _DETECT:
+        raise ValueError(
+            f"Mirai speech-to-text has no language detection ({code!r}): pass the language the "
+            f"caller speaks, one of {', '.join(STT_LANGUAGES)}"
+        )
+    raise ValueError(
+        f"language must be one of {', '.join(STT_LANGUAGES)} (or the bare code: 'hi', 'gu', ...); "
+        f"got {language!r}"
+    )
+
+
 @dataclass
 class MiraiSTTSettings(STTSettings):
     """Runtime-updatable settings for :class:`MiraiSTTService`.
@@ -176,9 +203,12 @@ class MiraiSTTSettings(STTSettings):
     Parameters:
         model: Mirai model name. Defaults to ``"mira-stt"``. A change opens a
             new socket at the next pause between utterances.
-        language: ``hi-IN`` (default), ``en-IN``, ``gu-IN``, ``mr-IN``,
-            ``pa-IN``, ``bn-IN``, ``ta-IN``, ``te-IN``, ``kn-IN`` or ``ml-IN``
-            (a ``Language`` works too). Changes apply on the open socket.
+        language: The language the caller speaks: ``hi-IN`` (default; Hindi
+            and Hinglish), ``en-IN``, ``gu-IN``, ``mr-IN``, ``pa-IN``,
+            ``bn-IN``, ``ta-IN``, ``te-IN``, ``kn-IN`` or ``ml-IN``. Any case,
+            the bare code (``"gu"``) or a Pipecat ``Language`` works too; there
+            is no ``"auto"`` (see :func:`stt_language`). A change applies on
+            the open socket (``config.update``).
         stream_type: ``"fast"`` or ``"balanced"``; ``None`` leaves it to Mirai.
         mode: ``"transcribe"`` or ``"codemix"`` (English words kept in Latin
             script); ``None`` leaves it to Mirai.
@@ -288,21 +318,23 @@ class MiraiSTTService(STTService):
       ``"vad"``; decided when the pipeline starts.
 
     Audio at 8 kHz (phone calls) goes as it is; any other rate is resampled
-    to 16 kHz (``sample_rate``). The socket opens on Mirai's edge, next to the
-    GPUs, when Mirai offers one, else on ``url`` (see
-    :mod:`pipecat_mirai.edge`), and usually comes ready from the process's
-    pool (see :mod:`pipecat_mirai.pool`). It opens in the background, so the
-    pipeline never waits for it: audio is held until it is up. If it drops,
-    the service dials once more and replays the audio Mirai hadn't answered
-    (up to 30 s); if that fails too it reports an ``ErrorFrame``.
+    to 16 kHz (``sample_rate``). The socket opens on ``url``, Mirai's API,
+    which sits next to the GPUs (were Mirai ever to offer an STT edge, it
+    would open there: see :mod:`pipecat_mirai.edge`), and usually comes ready
+    from the process's pool (see :mod:`pipecat_mirai.pool`). It opens in the
+    background, so the pipeline never waits for it: audio is held until it is
+    up. If it drops, the service dials once more and replays the audio Mirai
+    hadn't answered (up to 30 s); if that fails too it reports an
+    ``ErrorFrame``.
 
     Metrics: TTFB is ``speech_end`` sent (``vad.speech_end`` received under
     server endpointing) to the final received, reported with processing time
-    for the same span; usage is the audio seconds sent.
+    for the same span; usage is the audio seconds sent. What Mirai billed is
+    in ``audio_seconds_billed`` and ``cost_paise`` (from each ``session.end``).
 
     Example::
 
-        stt = MiraiSTTService(api_key=os.getenv("MIRAI_API_KEY"), language="hi-IN")
+        stt = MiraiSTTService(language="gu-IN")  # api_key from MIRAI_API_KEY
 
     Event handlers (from Pipecat): ``on_connected``, ``on_disconnected``,
     ``on_connection_error``.
@@ -334,7 +366,14 @@ class MiraiSTTService(STTService):
             url: The streaming endpoint,
                 ``wss://<host>/v1/audio/transcriptions/stream``. Defaults to
                 Mirai's sandbox.
-            language: Shortcut for ``settings.language``. Defaults to ``"hi-IN"``.
+            language: The language the caller speaks (shortcut for
+                ``settings.language``): ``"hi-IN"`` (the default; Hindi and
+                Hinglish), ``"en-IN"``, ``"gu-IN"``, ``"mr-IN"``, ``"pa-IN"``,
+                ``"bn-IN"``, ``"ta-IN"``, ``"te-IN"``, ``"kn-IN"`` or
+                ``"ml-IN"``, in any case, as the bare code (``"gu"``) or as a
+                Pipecat ``Language``. There is no language detection, so
+                ``"auto"`` is refused; anything outside the list raises
+                ``ValueError``.
             model: Shortcut for ``settings.model``. Defaults to ``"mira-stt"``.
             sample_rate: The rate audio is sent at. ``"auto"`` (the default)
                 sends 8 kHz audio as it is and resamples anything else to
@@ -344,10 +383,11 @@ class MiraiSTTService(STTService):
                 ``"alaw"`` (8 kHz only; half the bytes).
             endpointing: ``"auto"`` (default), ``"manual"`` or ``"vad"``: see the
                 class docstring.
-            edge: ``"auto"`` (default): open the socket on Mirai's edge when it
-                is offered, else on ``url``. ``False`` always uses ``url``; a
-                ``wss://`` URL uses that edge instead. ``MIRAI_STT_EDGE=off``
-                turns ``"auto"`` off.
+            edge: ``"auto"`` (default): open the socket on ``url``, or on an
+                STT edge if Mirai's API ever offers one (it offers none today,
+                and nothing is tried or waited for). ``False`` always uses
+                ``url``; a ``wss://`` URL uses that edge instead.
+                ``MIRAI_STT_EDGE=off`` turns ``"auto"`` off.
             shared_pool: Take a socket the process's pool opened ahead of need
                 (the default; the first service starts the pool). ``False``
                 always connects and starts no pool.
@@ -386,6 +426,7 @@ class MiraiSTTService(STTService):
         )
         if settings is not None:
             default_settings.apply_update(settings)
+        default_settings.language = stt_language(default_settings.language)
         kwargs.setdefault("ttfs_p99_latency", DEFAULT_TTFS_P99)
         super().__init__(settings=default_settings, **kwargs)
 
@@ -450,6 +491,10 @@ class MiraiSTTService(STTService):
         self.last_final_latency_ms: float | None = None
         #: Audio seconds sent over the service's life (replays included: they are billed).
         self.audio_seconds_sent = 0.0
+        #: What Mirai billed, summed over the sessions that ended with ``session.end``
+        #: (``audio_seconds_billed``, ``cost_paise``).
+        self.audio_seconds_billed = 0.0
+        self.cost_paise = 0.0
 
     # ---------- what Pipecat asks ----------
 
@@ -457,14 +502,12 @@ class MiraiSTTService(STTService):
         """Mirai STT reports TTFB, processing and usage metrics."""
         return True
 
-    def language_to_service_language(self, language: Language) -> str:
-        """``Language.HI`` / ``Language.HI_IN`` -> ``"hi-IN"``."""
-        code = str(getattr(language, "value", language))
-        base = code.split("-", 1)[0].lower()
-        for supported in STT_LANGUAGES:
-            if supported.split("-", 1)[0] == base:
-                return supported
-        return code
+    def language_to_service_language(self, language: Language) -> str | None:
+        """``Language.GU`` / ``Language.GU_IN`` -> ``"gu-IN"``; ``None`` if Mirai doesn't transcribe it."""
+        try:
+            return stt_language(language)
+        except ValueError:
+            return None
 
     @property
     def endpointing(self) -> str:
@@ -502,10 +545,6 @@ class MiraiSTTService(STTService):
         )
         if self._endpointing_option == "auto":
             self._endpointing = "manual" if self._pipeline_has_vad() else "vad"
-        if self._settings.language not in STT_LANGUAGES:
-            logger.warning(
-                f"{self}: language {self._settings.language!r} is not one of {', '.join(STT_LANGUAGES)}"
-            )
         self._build_urls()
         resampling = f", resampled from {in_rate} Hz" if self._resampler else ""
         logger.debug(
@@ -1190,8 +1229,13 @@ class MiraiSTTService(STTService):
             else:
                 self._start_replacement(urgent=True)
         elif kind == "session.end":
+            billed, cost = event.get("audio_seconds_billed"), event.get("cost_paise")
+            if isinstance(billed, int | float):
+                self.audio_seconds_billed += billed
+            if isinstance(cost, int | float):
+                self.cost_paise += cost
             logger.debug(
-                f"{self}: session {sock.session_id} ended: {event.get('audio_seconds_billed')} s billed, "
+                f"{self}: session {sock.session_id} ended: {billed} s billed, {cost} paise, "
                 f"{event.get('total_utterances')} utterances"
             )
             self._ended.set()
@@ -1281,7 +1325,17 @@ class MiraiSTTService(STTService):
     # ---------- settings ----------
 
     async def _update_settings(self, delta: STTSettings) -> dict[str, Any]:
-        """Language and tuning change on the open socket; model and prefix padding at the next pause."""
+        """Language and tuning change on the open socket; model and prefix padding at the next pause.
+
+        A language Mirai doesn't transcribe (or ``"auto"``) is not sent: the
+        socket keeps its language and a warning says why.
+        """
+        if is_given(delta.language):
+            try:
+                delta.language = stt_language(delta.language)
+            except ValueError as exc:
+                logger.warning(f"{self}: {exc}; keeping {self._settings.language}")
+                delta.language = NOT_GIVEN
         changed = await super()._update_settings(delta)
         if not changed or not self._started:
             return changed

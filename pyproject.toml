@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "pipecat-mirai"
 version = "0.6.0"
-description = "Mirai text-to-speech, speech-to-text and Realtime API (Hindi, Hinglish, Gujarati) for Pipecat voice agents"
+description = "Mirai text-to-speech, speech-to-text and Realtime API for Pipecat voice agents in Hindi, Hinglish, Gujarati and other Indian languages"
 readme = "README.md"
 license = "BSD-2-Clause"
 license-files = ["LICENSE"]

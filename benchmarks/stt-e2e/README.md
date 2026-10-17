@@ -26,7 +26,7 @@ service's and the network's, not a client library's.
 | `--key-file FILE` | file holding the API key (else `MIRAI_API_KEY`) |
 | `--procs N`, `--calls N` | worker processes, and calls in each (all at once) |
 | `--duration S` | seconds of audio per call (default 30; `0` plays a whole `--audio-dir` file) |
-| `--edge` / `--no-edge` | `--edge` mints a token on the API and connects to the edge it names (fails if none is offered); `--edge-url URL` names one yourself. Default is `--no-edge`: `--url` as given |
+| `--edge` / `--no-edge` | Default `--no-edge`: `--url` as given. Mirai's API serves speech-to-text itself and offers no STT edge, so `--edge` (mint a token, connect to the edge it names) stops with "offers no STT edge"; `--edge-url URL` names one yourself |
 | `--language`, `--model`, `--sample-rate 8000\|16000` | the socket's settings (defaults `hi-IN`, `mira-stt`, `8000`) |
 | `--endpointing manual\|vad` | `manual`: the harness sends `speech_start`/`speech_end` and measures from `speech_end`. `vad`: it streams everything and measures from Mirai's `vad.speech_end` |
 | `--stagger S` | seconds between call starts within a process (default 0.2) |
@@ -39,11 +39,10 @@ service's and the network's, not a client library's.
 unset VIRTUAL_ENV
 # against the local stand-in; no key:
 uv run python benchmarks/stt-e2e/run.py --standin --procs 2 --calls 5 --duration 20 --out /tmp/stt
-# Mirai's API, then the same call mix through its edge:
-uv run python benchmarks/stt-e2e/run.py --key-file key.txt --no-edge --procs 4 --calls 5 --out results/stt-api
-uv run python benchmarks/stt-e2e/run.py --key-file key.txt --edge --procs 4 --calls 5 --out results/stt-edge
+# Mirai's API:
+uv run python benchmarks/stt-e2e/run.py --key-file key.txt --procs 4 --calls 5 --out results/stt-api
 # 10 processes x 5 calls for 10 minutes of audio each, with recorded calls:
-uv run python benchmarks/stt-e2e/run.py --key-file key.txt --edge --procs 10 --calls 5 \
+uv run python benchmarks/stt-e2e/run.py --key-file key.txt --procs 10 --calls 5 \
     --duration 600 --audio-dir calls/ --out results/stt-soak
 ```
 

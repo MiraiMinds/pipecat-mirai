@@ -9,8 +9,8 @@ voice agents: natural Hindi, Hinglish and Gujarati voices.
   API (WebSocket, then HTTP) if the edge can't be reached. Audio comes at your
   pipeline's rate (8 kHz for phone calls).
 - **`MiraiSTTService`**: Mirai's streaming speech-to-text for the same
-  pipeline: partial and final transcripts over one WebSocket per call, from the
-  same edge, at 8 kHz as it comes off the phone (see
+  pipeline, in ten Indian languages: partial and final transcripts over one
+  WebSocket per call, at 8 kHz as it comes off the phone (see
   [Speech-to-text](#speech-to-text)).
 - **`MiraiRealtimeLLMService`**: hand Mirai the whole turn. Speech recognition,
   turn detection, the model and the voice run together on Mirai's side, and
@@ -269,44 +269,83 @@ the same instant ([how to run it yourself](benchmarks/burst-start/)):
 
 ## Speech-to-text
 
-`MiraiSTTService` streams the caller's audio to Mirai over one WebSocket and
-turns what comes back into Pipecat's transcription frames: partial transcripts
-as `InterimTranscriptionFrame`, and one `TranscriptionFrame` per utterance.
-
 ```python
 from pipecat_mirai import MiraiSTTService
 
-stt = MiraiSTTService(language="hi-IN")  # api_key from MIRAI_API_KEY
+stt = MiraiSTTService(language="hi-IN")
 
 pipeline = Pipeline([transport.input(), stt, user_aggregator, llm, tts, transport.output(), assistant_aggregator])
 ```
 
-Nothing else needs setting for a phone bot:
+That's the whole setup, with the same `MIRAI_API_KEY`. Partial transcripts come
+out as `InterimTranscriptionFrame`, and each utterance's final as one
+`TranscriptionFrame`.
+
+| Language | `language` |
+|---|---|
+| Hindi and Hinglish | `hi-IN` (default) |
+| English | `en-IN` |
+| Gujarati | `gu-IN` |
+| Marathi | `mr-IN` |
+| Punjabi | `pa-IN` |
+| Bengali | `bn-IN` |
+| Tamil | `ta-IN` |
+| Telugu | `te-IN` |
+| Kannada | `kn-IN` |
+| Malayalam | `ml-IN` |
+
+Pass the language your callers speak. There is no automatic language detection,
+so `"auto"` is refused; the bare code (`"gu"`) or a Pipecat `Language` works
+too. Which languages are in production, beta or preview is on the
+[languages page](https://docs.miraiminds.co/v2/stt-languages).
+
+Change the language mid-call with Pipecat's standard settings frame (it applies
+on the open socket):
+
+```python
+await task.queue_frame(STTUpdateSettingsFrame(delta=MiraiSTTSettings(language="gu-IN")))
+```
+
+### What it does for you
 
 - **Rate.** A pipeline at 8 kHz sends its audio as it is; any other rate is
   resampled to 16 kHz. `sample_rate=8000` or `16000` forces one, and
   `encoding="mulaw"` / `"alaw"` halves the bytes for telephony audio.
-- **Who ends the utterance** (`endpointing`). With a VAD in your pipeline
-  (a `vad_analyzer` on the user aggregator), the VAD's start and stop become
+- **Who ends the utterance** (`endpointing`). With a VAD in your pipeline (a
+  `vad_analyzer` on the user aggregator), the VAD's start and stop become
   `speech_start` and `speech_end`, and the service sends the 0.5 s of audio
-  before the VAD fired, so the first word isn't cut. The final comes back
-  within tens of milliseconds of `speech_end`, and nothing is sent between turns
-  but a keepalive. Without a VAD, Mirai's does the job and the service proposes
-  the turn boundaries to your aggregator. `endpointing="manual"` or `"vad"`
-  forces one.
-- **Where it connects.** Mirai's STT edge, next to the GPUs, when it is offered;
-  otherwise the API. A process keeps two sockets waiting, so a call's first audio
-  doesn't wait for a handshake (`prewarm(stt_websockets=…)` or
-  `MIRAI_WARM_STT_WEBSOCKETS` sets how many). `edge=False` always uses `url`,
-  and `MIRAI_STT_EDGE=off` turns the edge off for the process.
+  before the VAD fired, so the first word isn't cut. Nothing is sent between
+  turns but a keepalive. Without a VAD, Mirai's does the job and the service
+  proposes the turn boundaries to your aggregator. `endpointing="manual"` or
+  `"vad"` forces one.
+- **Where it connects.** Mirai's API, next to the speech GPUs, with your key in
+  the `Authorization` header. A process keeps two sockets waiting, so a call's
+  first audio doesn't wait for a handshake (`prewarm(stt_websockets=…)` or
+  `MIRAI_WARM_STT_WEBSOCKETS` sets how many).
 - **When something goes wrong.** A dropped socket is redialled once and the
-  audio Mirai hadn't answered (up to 30 s) is replayed; a fatal error from Mirai
-  (a revoked key, an empty wallet) is an `ErrorFrame`. A `429` is retried for a
-  few seconds before it is reported.
+  audio Mirai hadn't answered (up to 30 s) is replayed. A fatal error from Mirai
+  (a revoked key, an empty wallet) is an `ErrorFrame` with the API's own message.
+  A `429` is retried for a few seconds before it is reported.
+- **Long calls.** A session is replaced at a pause before it reaches Mirai's
+  session limit (an hour), so a long call carries on without a gap.
+- **Metrics.** Time to first byte is `speech_end` sent to the final, and usage
+  is the audio seconds sent. Pipecat tracing works.
 
-Metrics: time to first byte is `speech_end` sent to the final, and usage is the
-audio seconds sent. `language` and the VAD tuning (`settings=MiraiSTTSettings(...)`)
-change on the open socket, through Pipecat's `STTUpdateSettingsFrame`.
+Billing is per second of audio. `stt.audio_seconds_billed` and `stt.cost_paise`
+add up what Mirai billed for the sessions so far.
+
+| Argument | Default | |
+|---|---|---|
+| `api_key` | `$MIRAI_API_KEY` | Your Mirai API key |
+| `language` | `"hi-IN"` | One of the ten codes above |
+| `model` | `"mira-stt"` | Mirai's streaming speech-to-text model |
+| `sample_rate` | `"auto"` | `8000` or `16000` to force the rate sent |
+| `encoding` | `"auto"` (`linear16`) | `"mulaw"` / `"alaw"` at 8 kHz |
+| `endpointing` | `"auto"` | `"manual"` (your VAD) or `"vad"` (Mirai's) |
+| `settings` | | `MiraiSTTSettings(...)`: `language`, `mode` (`"codemix"` keeps English words in Latin script), `stream_type`, and Mirai's VAD tuning |
+| `url` | `wss://sandbox.voice.miraiminds.co/v1/audio/transcriptions/stream` | Mirai's streaming endpoint |
+| `shared_pool` | `True` | Take a socket the process's pool opened ahead of need |
+
 [`benchmarks/stt-e2e`](benchmarks/stt-e2e/) measures it under load, and
 [`examples/foundational/04-transcribe.py`](examples/foundational/04-transcribe.py)
 transcribes a recording.

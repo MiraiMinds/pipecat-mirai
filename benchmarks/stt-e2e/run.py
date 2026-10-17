@@ -31,11 +31,9 @@ Calls run in ``--procs`` worker processes, ``--calls`` calls in each (so
 
     # a local stand-in (tests/fake_mirai_stt.py), no key:
     uv run python benchmarks/stt-e2e/run.py --standin --procs 2 --calls 5 --duration 20 --out /tmp/stt
-    # Mirai's API, then the same through its edge:
-    uv run python benchmarks/stt-e2e/run.py --key-file key.txt --no-edge --procs 4 --calls 5 \\
+    # Mirai's API (which serves speech-to-text next to the GPUs; it offers no STT edge):
+    uv run python benchmarks/stt-e2e/run.py --key-file key.txt --procs 4 --calls 5 \\
         --out results/stt-api
-    uv run python benchmarks/stt-e2e/run.py --key-file key.txt --edge --procs 4 --calls 5 \\
-        --out results/stt-edge
 
 Prints a per-call table, a summary and PASS/FAIL flags; writes result.json and
 callNN.json (every latency, raw) to --out; exits 1 if any flag fails.

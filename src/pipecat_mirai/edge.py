@@ -4,20 +4,27 @@
 # SPDX-License-Identifier: BSD-2-Clause
 #
 
-"""Streaming TTS and STT from Mirai's edge, next to the GPUs.
+"""Streaming TTS (and, when Mirai offers one, STT) from Mirai's edge, next to the GPUs.
 
-Mirai serves its streaming sockets (TTS ``/v1/audio/speech/stream``, STT
-``/v1/audio/transcriptions/stream``) from an edge host beside its GPUs as well
-as through its API gateway; the edge cuts the time to the first byte. A socket
-for Mirai's own gateway opens straight on its edge with the API key in the
-``Authorization`` header, exactly as on the gateway: the edge checks the key
-with the gateway itself, so there is no extra round trip before the first
-byte. The gateway is still asked which edge it offers (``edge_url`` from
-``POST /v2/tts/stream/tokens`` or ``POST /v2/stt/stream/tokens``), in the
+Mirai serves its streaming text-to-speech socket (``/v1/audio/speech/stream``)
+from an edge host beside its GPUs as well as through its API gateway; the edge
+cuts the time to the first byte. A socket for Mirai's own gateway opens
+straight on its edge with the API key in the ``Authorization`` header, exactly
+as on the gateway: the edge checks the key with the gateway itself, so there is
+no extra round trip before the first byte. The gateway is still asked which
+edge it offers (``edge_url`` from ``POST /v2/tts/stream/tokens``), in the
 background, and its answer is remembered for ``EDGE_URL_TTL`` seconds: when
 the gateway stops offering the edge, sockets go back to the gateway. For any
 other gateway the answer is waited for before the first socket (sockets
 starting together share the one request).
+
+Streaming speech-to-text (``/v1/audio/transcriptions/stream``) has no edge
+today: Mirai's API serves it from beside the GPUs, so a socket for Mirai's own
+gateway opens on the gateway at once, without trying an edge or waiting for
+anything. The gateway is asked in the background whether it
+offers an STT edge (``POST /v2/stt/stream/tokens``; at most once every
+``NO_EDGE_RECHECK_SECS`` per process, and an answer is kept for
+``EDGE_URL_TTL``); if it ever does, later sockets use it, with everything below.
 
 Anything that goes wrong on the way leaves the socket to the gateway, exactly
 as before: no edge offered, a gateway without the token route (404/405), an
@@ -27,7 +34,8 @@ edge that refuses the connection or doesn't send its first event
 for ``EDGE_BACKOFF_SECS`` (doubling, up to ``EDGE_MAX_BACKOFF_SECS``), so a
 dead edge doesn't cost every call a timeout; it is logged as a warning once
 per process. After a failure, one socket at a time tries the edge again and
-the others wait for its answer. TTS and STT keep separate health.
+the others wait for its answer. TTS and STT keep separate health. No edge
+offered is not a failure: it is logged at debug level only.
 
 ``MIRAI_TTS_EDGE=off`` (``MIRAI_STT_EDGE=off``) turns the automatic edge off
 for that service in the whole process.
@@ -75,14 +83,13 @@ _probes: dict[tuple[str, str, int], asyncio.Future] = {}
 _warned: set[str] = set()
 
 # Mirai's own gateways and the edges next to their GPUs, per service. A socket
-# to one of these gateways goes straight to its edge with the API key, while
-# the gateway is asked in the background whether it still offers that edge.
-KNOWN_EDGES = {
+# to one of these gateways goes straight to its edge with the API key (``None``:
+# the gateway offers no edge, so straight to the gateway), while the gateway is
+# asked in the background whether it offers an edge now.
+KNOWN_EDGES: dict[tuple[str, str], str | None] = {
     ("sandbox.voice.miraiminds.co", "tts"): "wss://tts-edge.voice.miraiminds.co/v1/audio/speech/stream",
-    (
-        "sandbox.voice.miraiminds.co",
-        "stt",
-    ): "wss://stt-edge.voice.miraiminds.co/v1/audio/transcriptions/stream",
+    # Speech-to-text is served from the API itself, next to the GPUs: no edge.
+    ("sandbox.voice.miraiminds.co", "stt"): None,
 }
 EDGE_URL_TTL = 600.0  # seconds a gateway's answer about its edge is reused
 # token URL -> (edge URL or None, monotonic time to ask again), learned from a gateway.
@@ -326,9 +333,11 @@ class EdgeRoute:
     async def _edge_url(self) -> str | None:
         """Where this socket goes: a forced URL, the edge the gateway offers, or Mirai's known edge.
 
-        The gateway's answer is reused for ``EDGE_URL_TTL`` seconds. For Mirai's
-        own gateways the socket doesn't wait for it: it goes to the known edge
-        (or the last answer) while the gateway is asked in the background.
+        ``None``: no edge, use the gateway. The gateway's answer is reused for
+        ``EDGE_URL_TTL`` seconds. For Mirai's own gateways the socket doesn't
+        wait for it: it goes to the known edge (or the last answer; for a
+        gateway known to offer none, straight to the gateway) while the gateway
+        is asked in the background.
         """
         if self.mode != "auto":
             return self.mode
@@ -336,11 +345,11 @@ class EdgeRoute:
             learned = _edge_urls.get(self.token_url)
         if learned is not None and learned[1] > time.monotonic():
             return learned[0]
-        known = KNOWN_EDGES.get((urlparse(self.gateway_url).hostname or "", self.service))
-        if known is None:
+        host = (urlparse(self.gateway_url).hostname or "", self.service)
+        if host not in KNOWN_EDGES:
             return await asyncio.shield(self._ask())
         self._ask().add_done_callback(_consume)
-        return learned[0] if learned is not None else known
+        return learned[0] if learned is not None else KNOWN_EDGES[host]
 
     def _ask(self) -> asyncio.Task:
         """The question to the gateway about its edge; sockets asking together share it."""

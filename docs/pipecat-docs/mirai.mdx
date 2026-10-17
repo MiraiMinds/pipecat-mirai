@@ -135,9 +135,10 @@ breaks dropped from 6.6% to 0.08% at 3 concurrent calls and from 29.1% to 0.01% 
 ## Speech-to-text
 
 `MiraiSTTService` streams the caller's audio to Mirai's
-`/v1/audio/transcriptions/stream` WebSocket and emits `InterimTranscriptionFrame` for
-partial transcripts and one `TranscriptionFrame` per utterance, in order. It needs the
-same `MIRAI_API_KEY`.
+`/v1/audio/transcriptions/stream` WebSocket, which runs next to Mirai's speech GPUs,
+and emits `InterimTranscriptionFrame` for partial transcripts and one
+`TranscriptionFrame` per utterance, in order. It needs the same `MIRAI_API_KEY`,
+sent in the `Authorization` header.
 
 ```python
 from pipecat_mirai import MiraiSTTService
@@ -156,8 +157,10 @@ pipeline = Pipeline([
 ```
 
 <ParamField path="language" type="str | Language" default="hi-IN">
-  `hi-IN`, `en-IN`, `gu-IN`, `mr-IN`, `pa-IN`, `bn-IN`, `ta-IN`, `te-IN`, `kn-IN` or
-  `ml-IN`. Changes on the open socket.
+  The language your callers speak: `hi-IN` (Hindi and Hinglish), `en-IN`, `gu-IN`,
+  `mr-IN`, `pa-IN`, `bn-IN`, `ta-IN`, `te-IN`, `kn-IN` or `ml-IN`. Any case, the bare
+  code (`gu`) or a Pipecat `Language` works too. There is no automatic language
+  detection, so `auto` is refused. Changes on the open socket.
 </ParamField>
 
 <ParamField path="model" type="str" default="mira-stt">
@@ -179,11 +182,6 @@ pipeline = Pipeline([
   the first word isn't cut), and nothing is sent between turns. `"vad"`: Mirai's VAD;
   audio streams continuously and the service proposes turn boundaries to the user
   aggregator. `"auto"` picks `"manual"` when the pipeline has a VAD.
-</ParamField>
-
-<ParamField path="edge" type="bool | str" default="auto">
-  Open sockets on Mirai's STT edge, next to the GPUs, when it is offered, and on `url`
-  otherwise. `False` always uses `url`. `MIRAI_STT_EDGE=off` turns it off for the process.
 </ParamField>
 
 <ParamField path="url" type="str" default="wss://sandbox.voice.miraiminds.co/v1/audio/transcriptions/stream">
