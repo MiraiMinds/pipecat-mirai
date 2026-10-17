@@ -303,7 +303,7 @@ Change the language mid-call with Pipecat's standard settings frame (it applies
 on the open socket):
 
 ```python
-await task.queue_frame(STTUpdateSettingsFrame(delta=MiraiSTTSettings(language="gu-IN")))
+await task.queue_frame(STTUpdateSettingsFrame(delta=MiraiSTTService.Settings(language="gu-IN")))
 ```
 
 ### What it does for you
@@ -342,7 +342,7 @@ add up what Mirai billed for the sessions so far.
 | `sample_rate` | `"auto"` | `8000` or `16000` to force the rate sent |
 | `encoding` | `"auto"` (`linear16`) | `"mulaw"` / `"alaw"` at 8 kHz |
 | `endpointing` | `"auto"` | `"manual"` (your VAD) or `"vad"` (Mirai's) |
-| `settings` | | `MiraiSTTSettings(...)`: `language`, `mode` (`"codemix"` keeps English words in Latin script), `stream_type`, and Mirai's VAD tuning |
+| `settings` | `language="hi-IN"`, `model="mira-stt"` | `MiraiSTTService.Settings(...)`: `language`, `mode` (`"codemix"` keeps English words in Latin script), `stream_type`, and Mirai's VAD tuning |
 | `url` | `wss://sandbox.voice.miraiminds.co/v1/audio/transcriptions/stream` | Mirai's streaming endpoint |
 | `shared_pool` | `True` | Take a socket the process's pool opened ahead of need |
 
