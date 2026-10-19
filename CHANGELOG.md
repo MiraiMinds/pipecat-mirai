@@ -4,10 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [0.6.0] - Unreleased
-
-Not on PyPI yet: it is published once Mirai's streaming speech-to-text API is
-live.
+## [0.6.0] - 2026-10-17
 
 ### Added
 

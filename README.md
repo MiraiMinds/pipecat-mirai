@@ -1,7 +1,8 @@
 # pipecat-mirai
 
 [Mirai](https://miraiminds.co) for [Pipecat](https://github.com/pipecat-ai/pipecat)
-voice agents: natural Hindi, Hinglish and Gujarati voices.
+voice agents: natural voices in Hindi, Hinglish, Gujarati, English, Tamil and
+Telugu, and speech-to-text in ten Indian languages.
 
 - **`MiraiTTSService`**: Mirai's voices in your Pipecat pipeline. One service,
   defaults that hold up under load: it streams over one WebSocket per call from
@@ -19,9 +20,6 @@ voice agents: natural Hindi, Hinglish and Gujarati voices.
   server is busy (see [Phone calls](#phone-calls)). `MiraiTTSService` applies
   it to your output transport for you; call it yourself only for another TTS
   vendor.
-
-**Demo:** [a 68-second conversation in Hindi with an interruption](https://github.com/MiraiMinds/pipecat-mirai/releases/download/v0.1.0/pipecat-mirai-demo.mp4)
-(Pipecat 1.12, Sarvam STT, Mirai TTS).
 
 ## Installation
 
