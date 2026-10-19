@@ -1444,7 +1444,7 @@ websocket = [
 
 [[package]]
 name = "pipecat-mirai"
-version = "0.5.1"
+version = "0.6.1"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
@@ -1467,7 +1467,7 @@ dev = [
 requires-dist = [
     { name = "httpx", specifier = ">=0.27,<1" },
     { name = "numpy", specifier = ">=1.26" },
-    { name = "pipecat-ai", specifier = ">=1.8.1,<2" },
+    { name = "pipecat-ai", specifier = ">=1.8.1,<1.13" },
     { name = "soxr", specifier = ">=0.3" },
     { name = "websockets", specifier = ">=13" },
 ]

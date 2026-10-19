@@ -4,10 +4,19 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [0.6.0] - Unreleased
+## [0.6.1] - 2026-10-19
 
-Not on PyPI yet: it is published once Mirai's streaming speech-to-text API is
-live.
+### Fixed
+
+- Requires `pipecat-ai<1.13`. With Pipecat 1.13.0, a TTS socket that drops
+  mid-reply reconnects but the reply is lost ("completed with no audio") on
+  both the edge and the gateway. Support for 1.13 follows in a later release.
+
+### Changed
+
+- README: the intro names the voice and speech-to-text languages.
+
+## [0.6.0] - 2026-10-17
 
 ### Added
 

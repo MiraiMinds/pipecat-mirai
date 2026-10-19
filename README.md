@@ -1,7 +1,8 @@
 # pipecat-mirai
 
 [Mirai](https://miraiminds.co) for [Pipecat](https://github.com/pipecat-ai/pipecat)
-voice agents: natural Hindi, Hinglish and Gujarati voices.
+voice agents: natural voices in Hindi, Hinglish, Gujarati, English, Tamil and
+Telugu, and speech-to-text in ten Indian languages.
 
 - **`MiraiTTSService`**: Mirai's voices in your Pipecat pipeline. One service,
   defaults that hold up under load: it streams over one WebSocket per call from
@@ -20,9 +21,6 @@ voice agents: natural Hindi, Hinglish and Gujarati voices.
   it to your output transport for you; call it yourself only for another TTS
   vendor.
 
-**Demo:** [a 68-second conversation in Hindi with an interruption](https://github.com/MiraiMinds/pipecat-mirai/releases/download/v0.1.0/pipecat-mirai-demo.mp4)
-(Pipecat 1.12, Sarvam STT, Mirai TTS).
-
 ## Installation
 
 ```bash
@@ -33,7 +31,7 @@ uv add pipecat-mirai     # or: pip install pipecat-mirai
 
 - A Mirai API key (`sk_live_…`) from the [Mirai console](https://sandbox.voice.miraiminds.co).
   Set it as `MIRAI_API_KEY`, or pass `api_key=`.
-- Pipecat 1.8.1 or newer and Python 3.11+.
+- Pipecat 1.8.1 to 1.12.x and Python 3.11+.
 
 ## Usage
 
@@ -462,7 +460,9 @@ p50 422 ms, p95 641 ms after the greeting
 
 ## Compatibility
 
-Tested with Pipecat 1.8.1 and 1.12.0 on Python 3.11–3.12. `apply_output_lead` changes how
+Tested with Pipecat 1.8.1 and 1.12.0 on Python 3.11–3.12. Pipecat 1.13 is not
+supported yet: when a socket drops mid-reply, its reconnect loses that reply,
+so the package installs Pipecat below 1.13. `apply_output_lead` changes how
 Pipecat's websocket output transports time their writes. A test in this repo
 fails if a new Pipecat release changes that, and the function logs a warning and
 does nothing for transports it doesn't support.
