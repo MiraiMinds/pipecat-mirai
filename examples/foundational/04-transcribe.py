@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pipecat-mirai>=0.6.0"]
+# dependencies = ["pipecat-mirai>=0.7.0"]
 # ///
 #
 # Copyright (c) 2026, Sona Labs Pvt Ltd
@@ -12,6 +12,8 @@
 
     export MIRAI_API_KEY=sk_live_...
     uv run examples/foundational/04-transcribe.py call.wav --language hi-IN
+    uv run examples/foundational/04-transcribe.py call.wav --language hi-IN --secondary-languages en-IN
+    uv run examples/foundational/04-transcribe.py call.wav --language auto
 
 From a checkout of this repository, `uv run python examples/foundational/04-transcribe.py call.wav`
 uses the local package instead.
@@ -21,6 +23,8 @@ fed to `MiraiSTTService` in 20 ms frames, at real time with --realtime or as fas
 the pipeline takes it. Mirai finds where each utterance ends (`endpointing="vad"`, since
 there is no VAD in this pipeline), so you see partial transcripts grow and then one
 final transcript per utterance, with how long the final took after the speaker stopped.
+With --language auto or --secondary-languages, each final also shows the language
+Mirai heard it in.
 
 No room, microphone or LLM is needed. The audio is billed like any other streaming
 transcription (per second of audio sent).
@@ -53,7 +57,9 @@ class Printer(FrameProcessor):
             print(f"\r  ... {frame.text}", end="\033[K", flush=True)
         elif isinstance(frame, TranscriptionFrame):
             took = (frame.result or {}).get("latency_ms")
-            print(f"\r{len(self.finals) + 1:>3}. {frame.text or '(nothing heard)'}", end="\033[K")
+            heard = (frame.result or {}).get("language") or (frame.result or {}).get("language_code")
+            heard = f" ({heard})" if heard else ""
+            print(f"\r{len(self.finals) + 1:>3}. {frame.text or '(nothing heard)'}{heard}", end="\033[K")
             print(f"   [{took:.0f} ms after the speaker stopped]" if took is not None else "")
             self.finals.append(frame.text)
         await self.push_frame(frame, direction)
@@ -68,7 +74,12 @@ def read_wav(path):
 
 async def main(args):
     pcm, rate = read_wav(args.wav)
-    stt = MiraiSTTService(url=args.url, language=args.language, endpointing="vad")
+    stt = MiraiSTTService(
+        url=args.url,
+        language=args.language,
+        secondary_languages=args.secondary_languages,
+        endpointing="vad",
+    )
     printer = Printer()
     worker = PipelineWorker(
         Pipeline([stt, printer]),
@@ -104,7 +115,12 @@ if __name__ == "__main__":
     p.add_argument(
         "--language",
         default="hi-IN",
-        help="hi-IN, en-IN, gu-IN, mr-IN, pa-IN, bn-IN, ta-IN, te-IN, kn-IN or ml-IN",
+        help="hi-IN, en-IN, gu-IN, mr-IN, pa-IN, bn-IN, ta-IN, te-IN, kn-IN or ml-IN; or auto",
+    )
+    p.add_argument(
+        "--secondary-languages",
+        default=None,
+        help="up to three more codes callers may switch to, comma-separated (en-IN,gu-IN)",
     )
     p.add_argument("--url", default=DEFAULT_STT_WEBSOCKET_URL, help="Mirai's streaming STT WebSocket URL")
     p.add_argument("--realtime", action="store_true", help="feed the audio at real time instead of at once")

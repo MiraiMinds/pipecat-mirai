@@ -4,6 +4,30 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] - Unreleased
+
+### Added
+
+- **Automatic language identification in `MiraiSTTService`.**
+  `language="auto"` (or `"unknown"`) is now accepted and sent as
+  `language_code=auto`: Mirai works out each utterance's language among the
+  ten and remembers what it heard earlier in the session. Other providers'
+  names for detection (`"multi"`, `"detect"`, `"multilingual"`) still raise
+  `ValueError`, now pointing to `"auto"`.
+- **`secondary_languages`** on `MiraiSTTService` and `MiraiSTTService.Settings`:
+  up to three more of the ten codes that callers may switch to, with a fixed
+  `language` (a list, or a comma-separated string). Codes are validated like
+  `language` (any case, bare codes, Pipecat `Language`); duplicates and the
+  primary are dropped; `"auto"` with secondary languages, a code outside the
+  ten or more than three raise `ValueError` (a runtime update with them is not
+  sent and is logged as a warning). They go on the socket as
+  `secondary_languages=en-IN,gu-IN` and change on the open socket with
+  `config.update`; a change to `"auto"` clears them in the same update.
+- In an `auto` or secondary-language session, `TranscriptionFrame.language`
+  and `InterimTranscriptionFrame.language` are the language Mirai heard that
+  utterance in (the event's `language`, or `language_code`), and `None` when
+  an `auto` transcript names none.
+
 ## [0.6.1] - 2026-10-19
 
 ### Fixed

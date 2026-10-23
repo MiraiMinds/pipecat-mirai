@@ -1,11 +1,13 @@
 """A fake of Mirai's streaming STT socket (``/v1/audio/transcriptions/stream``), for tests.
 
 It implements the protocol from the server's side, as Mirai's STT gateway
-speaks it. The query (``language_code``, ``model``,
+speaks it. The query (``language_code``, ``secondary_languages``, ``model``,
 ``encoding``, ``sample_rate``, ``endpointing``, tuning) is validated before the
-upgrade: an unknown parameter, or a ``language_code`` not spelled as one of
-the ten codes, is a 400 ``invalid_config`` (a ``config.update`` to such a
-language is a fatal ``invalid_config`` error). Then
+upgrade: an unknown parameter, a ``language_code`` not spelled as one of the
+ten codes or ``auto`` / ``unknown``, or ``secondary_languages`` that aren't up
+to three of the ten (comma-separated) with a fixed ``language_code``, is a 400
+``invalid_config`` (a ``config.update`` to such languages is a fatal
+``invalid_config`` error). Then
 ``session.begin`` {request_id, session_id, config, capabilities, limits}, and:
 
 - ``audio_input``: audio is decoded (linear16, mulaw or alaw) and kept.
@@ -18,6 +20,12 @@ language is a fatal ``invalid_config`` error). Then
   after it ends. The text names the utterance's loudest frequency and its
   length (``"440 hertz, 0.8 seconds"``), so a test knows which utterance a
   final is for whichever socket heard it; silence gives an empty final.
+- In an ``auto`` or secondary-language session, partials and finals carry the
+  language heard (in the ``language_field`` key, ``"language"`` by default):
+  ``heard`` maps an utterance's loudest frequency to a language, and anything
+  else (or a language outside a secondary session's list) is the primary
+  (``hi-IN`` under ``auto``). A fixed-language session's finals carry
+  ``language_code``, the session's language.
 - ``flush`` finalises the open utterance; ``config.update`` answers
   ``config.updated``; ``ping`` answers ``pong``; ``end`` finalises what is
   open, waits for the finals, sends ``session.end`` and closes.
@@ -35,7 +43,8 @@ close), ``drain_after_s`` (send ``session.draining`` on the first connection
 that many seconds after it opens, and end it ``drain_grace_s`` later),
 ``fatal_error`` (an error event, e.g. ``{"code": "insufficient_balance"}``,
 sent with ``is_fatal`` instead of the first final, then the socket closes),
-``partial_every_s`` and ``silent`` (never send session.begin).
+``partial_every_s``, ``silent`` (never send session.begin), ``heard`` and
+``language_field``.
 ``handshakes`` records every handshake's path, query and headers; ``conns``
 every session, with what it received.
 """
@@ -57,6 +66,7 @@ from websockets.http11 import Response
 PATH = "/v1/audio/transcriptions/stream"
 ALLOWED = {
     "language_code",
+    "secondary_languages",
     "model",
     "encoding",
     "sample_rate",
@@ -72,6 +82,23 @@ ALLOWED = {
 }
 # The codes the socket takes (the client sends them spelled exactly so).
 LANGUAGES = ("hi-IN", "en-IN", "gu-IN", "mr-IN", "pa-IN", "bn-IN", "ta-IN", "te-IN", "kn-IN", "ml-IN")
+AUTO = ("auto", "unknown")
+
+
+def languages_problem(language: str, secondary: str) -> str | None:
+    """Why ``language_code`` / ``secondary_languages`` would be refused, or None."""
+    if language not in LANGUAGES + AUTO:
+        return f"language_code must be auto or one of {', '.join(LANGUAGES)}"
+    codes = [c.strip() for c in secondary.split(",") if c.strip()]
+    if any(c not in LANGUAGES for c in codes):
+        return "secondary_languages accepts " + ", ".join(LANGUAGES)
+    if len(set(codes)) > 3:
+        return "secondary_languages takes at most 3 languages"
+    if codes and language in AUTO:
+        return "secondary_languages needs an explicit primary language_code"
+    return None
+
+
 VAD_FRAME_SECS = 0.02
 VAD_RMS = 300.0
 
@@ -129,6 +156,7 @@ class _Conn:
         self.rate = int(query.get("sample_rate", "16000"))
         self.endpointing = query.get("endpointing", "vad")
         self.language = query.get("language_code", "hi-IN")
+        self.secondary = query.get("secondary_languages", "")
         self.width = 2 if self.encoding == "linear16" else 1
         self.received: list[dict] = []  # every event (audio_input with "bytes" instead of "audio")
         self.audio = bytearray()  # every audio byte received
@@ -153,6 +181,11 @@ class _Conn:
     def events(self, kind=None) -> list[dict]:
         return [e for e in self.received if kind is None or e.get("event") == kind]
 
+    @property
+    def multi(self) -> bool:
+        """An auto or secondary-language session (each transcript names its language)."""
+        return self.language in AUTO or bool(self.secondary)
+
 
 class FakeMiraiSTT:
     def __init__(
@@ -172,6 +205,8 @@ class FakeMiraiSTT:
         fatal_error=None,
         partial_every_s=0.12,
         silent=False,
+        heard=None,
+        language_field="language",
     ):
         self.auth = auth
         self.refuse_status = refuse_status
@@ -187,6 +222,8 @@ class FakeMiraiSTT:
         self.fatal_error = fatal_error
         self.partial_every_s = partial_every_s
         self.silent = silent
+        self.heard = dict(heard or {})
+        self.language_field = language_field
         self.attempts = 0
         self.handshakes: list[dict] = []
         self.conns: list[_Conn] = []
@@ -221,8 +258,11 @@ class FakeMiraiSTT:
                 return _refusal(400, "invalid_config", f"unknown parameter {unknown[0]!r}")
             if query.get("sample_rate", "16000") not in ("8000", "16000"):
                 return _refusal(400, "invalid_config", "sample_rate must be 8000 or 16000")
-            if query.get("language_code", "hi-IN") not in LANGUAGES:
-                return _refusal(400, "invalid_config", f"language_code must be one of {', '.join(LANGUAGES)}")
+            problem = languages_problem(
+                query.get("language_code", "hi-IN"), query.get("secondary_languages", "")
+            )
+            if problem:
+                return _refusal(400, "invalid_config", problem)
             if self.capacity is not None and self.active >= self.capacity:
                 return _refusal(429, "at_capacity", "STT is at capacity", retry_after=True)
             return None
@@ -297,7 +337,9 @@ class FakeMiraiSTT:
                 self._close(conn)
         elif kind == "config.update":
             fields = {k: v for k, v in event.items() if k != "event"}
-            if fields.get("language_code", conn.language) not in LANGUAGES:
+            language = fields.get("language_code", conn.language)
+            secondary = fields.get("secondary_languages", conn.secondary)
+            if languages_problem(language, secondary):
                 # As the engine answers it: fatal, and the socket closes.
                 await self._send(
                     conn,
@@ -310,7 +352,7 @@ class FakeMiraiSTT:
                 )
                 await conn.ws.close(4000, "invalid_config")
                 return
-            conn.language = fields.get("language_code", conn.language)
+            conn.language, conn.secondary = language, secondary
             await self._send(conn, {"event": "config.updated", "config": fields})
         elif kind == "ping":
             await self._send(conn, {"event": "pong"})
@@ -360,6 +402,14 @@ class FakeMiraiSTT:
         utt.ended_at = time.monotonic()
         conn.finals.put_nowait(utt)
 
+    def language_for(self, conn: _Conn, audio: bytes) -> str:
+        """The language an auto or secondary-language session hears ``audio`` in."""
+        primary = "hi-IN" if conn.language in AUTO else conn.language
+        heard = self.heard.get(dominant_hz(decode(bytes(audio), conn.encoding), conn.rate), primary)
+        if conn.language in AUTO:
+            return heard
+        return heard if heard in [c.strip() for c in conn.secondary.split(",")] else primary
+
     def text_for(self, conn: _Conn, audio: bytes) -> str:
         pcm = decode(bytes(audio), conn.encoding)
         hz = dominant_hz(pcm, conn.rate)
@@ -376,9 +426,10 @@ class FakeMiraiSTT:
             utt.partials = due
             text = self.text_for(conn, utt.audio)
             if text:
-                await self._send(
-                    conn, {"event": "transcript.partial", "utterance_idx": utt.idx, "text": text}
-                )
+                partial = {"event": "transcript.partial", "utterance_idx": utt.idx, "text": text}
+                if conn.multi:
+                    partial[self.language_field] = self.language_for(conn, utt.audio)
+                await self._send(conn, partial)
 
     async def _finalizer(self, conn: _Conn):
         """One final per utterance, in order, slow_final_s after it ended."""
@@ -397,15 +448,12 @@ class FakeMiraiSTT:
                     continue
                 text = self.text_for(conn, utt.audio)
                 self.finals_sent.append((conn.number, text))
-                await self._send(
-                    conn,
-                    {
-                        "event": "transcript.final",
-                        "utterance_idx": utt.idx,
-                        "text": text,
-                        "language_code": conn.language,
-                    },
-                )
+                final = {"event": "transcript.final", "utterance_idx": utt.idx, "text": text}
+                if conn.multi:
+                    final[self.language_field] = self.language_for(conn, utt.audio)
+                else:
+                    final["language_code"] = conn.language
+                await self._send(conn, final)
             finally:
                 conn.finals.task_done()
 

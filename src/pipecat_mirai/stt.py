@@ -19,7 +19,9 @@ endpointing), ``transcript.partial`` (a full snapshot of the utterance so far),
 ``pong``, ``session.draining``, ``session.end`` (audio seconds billed, cost in
 paise) and ``error`` {code, message, is_fatal}. Settings that fix the stream
 (model, encoding, rate, endpointing) travel in the connection's query string;
-language and tuning can change on an open socket with ``config.update``.
+language (``language_code``, a code or ``auto``), ``secondary_languages`` and
+tuning can change on an open socket with ``config.update``. In an ``auto`` or
+secondary-language session each transcript names the language it was heard in.
 """
 
 from __future__ import annotations
@@ -30,7 +32,7 @@ import json
 import os
 import time
 from collections import deque
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Iterable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlparse
@@ -73,8 +75,14 @@ DEFAULT_LANGUAGE = "hi-IN"
 DEFAULT_MODEL = "mira-stt"
 #: The languages Mirai's speech-to-text transcribes (``language_code`` on the socket).
 STT_LANGUAGES = ("hi-IN", "en-IN", "gu-IN", "mr-IN", "pa-IN", "bn-IN", "ta-IN", "te-IN", "kn-IN", "ml-IN")
-# Asks for language detection, which Mirai's speech-to-text doesn't do.
-_DETECT = frozenset({"auto", "unknown", "detect", "multi", "multilingual"})
+#: ``language`` that asks Mirai to work out each utterance's language among :data:`STT_LANGUAGES`.
+AUTO_LANGUAGE = "auto"
+# Mirai's names for it ("unknown" is Sarvam's), sent as AUTO_LANGUAGE.
+_AUTO = frozenset({"auto", "unknown"})
+# Other providers' names for language detection: refused, with a pointer to "auto".
+_DETECT = frozenset({"detect", "multi", "multilingual"})
+#: The most ``secondary_languages`` a session takes.
+MAX_SECONDARY_LANGUAGES = 3
 # The rates and encodings the socket takes.
 WIRE_SAMPLE_RATES = (8000, 16000)
 ENCODINGS = ("linear16", "mulaw", "alaw")
@@ -158,6 +166,9 @@ _HANDSHAKE_CATEGORIES = {
     429: ErrorCategory.RATE_LIMIT,
 }
 _PERMANENT_STATUSES = frozenset({400, 401, 402, 403, 404, 426})
+_CHECK_SETTINGS = (
+    "Check the language, secondary_languages, model, sample_rate, encoding and endpointing settings."
+)
 _ADVICE = {
     "unauthorized": "Check MIRAI_API_KEY.",
     401: "Check MIRAI_API_KEY.",
@@ -167,33 +178,75 @@ _ADVICE = {
     402: "The workspace is out of credit. Top it up in the Mirai console.",
     "at_capacity": "Ask Mirai to raise this workspace's concurrent STT session limit.",
     429: "Ask Mirai to raise this workspace's concurrent STT session limit.",
-    "invalid_config": "Check the language, model, sample_rate, encoding and endpointing settings.",
-    400: "Check the language, model, sample_rate, encoding and endpointing settings.",
+    "invalid_config": _CHECK_SETTINGS,
+    400: _CHECK_SETTINGS,
 }
 
 
-def stt_language(language: str | Language) -> str:
+def stt_language(language: str | Language, *, allow_auto: bool = True) -> str:
     """The language code Mirai's speech-to-text takes for ``language``, or a ``ValueError``.
 
     One of :data:`STT_LANGUAGES` in any case (``"gu-in"``), the bare language
     (``"gu"``) or a Pipecat ``Language`` (``Language.GU``, ``Language.GU_IN``)
-    all give ``"gu-IN"``. There is no language detection: ``"auto"`` and
-    ``"unknown"`` are refused, as are languages outside the list.
+    all give ``"gu-IN"``. ``"auto"`` (or ``"unknown"``) gives ``"auto"``:
+    Mirai works out each utterance's language among the ten. Languages outside
+    the list are refused, and so is ``"auto"`` when ``allow_auto`` is false.
     """
     code = str(getattr(language, "value", language) or "").strip()
     lowered = code.lower()
     for supported in STT_LANGUAGES:
         if lowered in (supported.lower(), supported.split("-", 1)[0]):
             return supported
+    if lowered in _AUTO and allow_auto:
+        return AUTO_LANGUAGE
     if lowered in _DETECT:
         raise ValueError(
-            f"Mirai speech-to-text has no language detection ({code!r}): pass the language the "
-            f"caller speaks, one of {', '.join(STT_LANGUAGES)}"
+            f"Mirai speech-to-text spells language detection 'auto' (got {code!r}); "
+            f"or pass the language the caller speaks, one of {', '.join(STT_LANGUAGES)}"
         )
+    auto = ", or 'auto'" if allow_auto else ""
     raise ValueError(
-        f"language must be one of {', '.join(STT_LANGUAGES)} (or the bare code: 'hi', 'gu', ...); "
-        f"got {language!r}"
+        f"language must be one of {', '.join(STT_LANGUAGES)} (or the bare code: 'hi', 'gu', ...)"
+        f"{auto}; got {language!r}"
     )
+
+
+def stt_secondary_languages(
+    languages: Iterable[str | Language] | str | None, language: str | Language = DEFAULT_LANGUAGE
+) -> tuple[str, ...]:
+    """``secondary_languages`` as Mirai's codes, or a ``ValueError``.
+
+    A list (or a comma-separated string) of up to
+    :data:`MAX_SECONDARY_LANGUAGES` of :data:`STT_LANGUAGES`, each taken as
+    :func:`stt_language` takes it. Duplicates and ``language`` itself are
+    dropped. They need a fixed ``language``: with ``"auto"`` every language is
+    already considered, so a non-empty list is refused, as the API refuses it.
+    """
+    if languages is None:
+        return ()
+    if isinstance(languages, str):  # "en-IN,gu-IN", or a Pipecat Language (a str enum)
+        items: list[Any] = [part for part in languages.split(",") if part.strip()]
+    else:
+        items = list(languages)
+    primary = stt_language(language)
+    codes: list[str] = []
+    for item in items:
+        try:
+            code = stt_language(item, allow_auto=False)
+        except ValueError as exc:
+            raise ValueError(f"secondary_languages: {exc}") from None
+        if code != primary and code not in codes:
+            codes.append(code)
+    if codes and primary == AUTO_LANGUAGE:
+        raise ValueError(
+            "secondary_languages need a fixed language: with language='auto' Mirai already "
+            "considers every language"
+        )
+    if len(codes) > MAX_SECONDARY_LANGUAGES:
+        raise ValueError(
+            f"secondary_languages takes at most {MAX_SECONDARY_LANGUAGES} languages; got {len(codes)}"
+        )
+    return tuple(codes)
 
 
 @dataclass
@@ -206,9 +259,17 @@ class MiraiSTTSettings(STTSettings):
         language: The language the caller speaks: ``hi-IN`` (default; Hindi
             and Hinglish), ``en-IN``, ``gu-IN``, ``mr-IN``, ``pa-IN``,
             ``bn-IN``, ``ta-IN``, ``te-IN``, ``kn-IN`` or ``ml-IN``. Any case,
-            the bare code (``"gu"``) or a Pipecat ``Language`` works too; there
-            is no ``"auto"`` (see :func:`stt_language`). A change applies on
-            the open socket (``config.update``).
+            the bare code (``"gu"``) or a Pipecat ``Language`` works too.
+            ``"auto"`` (or ``"unknown"``) has Mirai work out each utterance's
+            language among the ten (see :func:`stt_language`). A change applies
+            on the open socket (``config.update``); a change to ``"auto"``
+            clears ``secondary_languages``.
+        secondary_languages: Up to three more of the ten that callers may
+            switch to, with a fixed ``language`` (see
+            :func:`stt_secondary_languages`). ``language`` stays the default and
+            an utterance moves to one of these only when Mirai is confident.
+            ``()`` (the default) listens for ``language`` alone. A change applies
+            on the open socket.
         stream_type: ``"fast"`` or ``"balanced"``; ``None`` leaves it to Mirai.
         mode: ``"transcribe"`` or ``"codemix"`` (English words kept in Latin
             script); ``None`` leaves it to Mirai.
@@ -219,6 +280,9 @@ class MiraiSTTSettings(STTSettings):
             fixed for a socket, so a change opens a new one).
     """
 
+    secondary_languages: tuple[str, ...] | list[str] | str | None | NotGiven = field(
+        default_factory=lambda: NOT_GIVEN
+    )
     stream_type: str | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
     mode: str | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
     threshold: float | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
@@ -332,9 +396,17 @@ class MiraiSTTService(STTService):
     for the same span; usage is the audio seconds sent. What Mirai billed is
     in ``audio_seconds_billed`` and ``cost_paise`` (from each ``session.end``).
 
+    Languages: pass the one your callers speak (``language="gu-IN"``); add
+    ``secondary_languages`` when they may switch between known languages; use
+    ``language="auto"`` only when you don't know it. In an ``auto`` or
+    secondary-language session each frame's ``language`` is the language Mirai
+    heard that utterance in.
+
     Example::
 
         stt = MiraiSTTService(language="gu-IN")  # api_key from MIRAI_API_KEY
+        stt = MiraiSTTService(language="hi-IN", secondary_languages=["en-IN"])
+        stt = MiraiSTTService(language="auto")
 
     Event handlers (from Pipecat): ``on_connected``, ``on_disconnected``,
     ``on_connection_error``.
@@ -349,6 +421,7 @@ class MiraiSTTService(STTService):
         api_key: str | None = None,
         url: str | None = None,
         language: str | Language = DEFAULT_LANGUAGE,
+        secondary_languages: Iterable[str | Language] | str | None = None,
         model: str = DEFAULT_MODEL,
         sample_rate: int | Literal["auto"] = "auto",
         encoding: Literal["auto", "linear16", "mulaw", "alaw"] = "auto",
@@ -371,9 +444,13 @@ class MiraiSTTService(STTService):
                 Hinglish), ``"en-IN"``, ``"gu-IN"``, ``"mr-IN"``, ``"pa-IN"``,
                 ``"bn-IN"``, ``"ta-IN"``, ``"te-IN"``, ``"kn-IN"`` or
                 ``"ml-IN"``, in any case, as the bare code (``"gu"``) or as a
-                Pipecat ``Language``. There is no language detection, so
-                ``"auto"`` is refused; anything outside the list raises
-                ``ValueError``.
+                Pipecat ``Language``; or ``"auto"`` when you don't know it.
+                Anything else raises ``ValueError``.
+            secondary_languages: Shortcut for ``settings.secondary_languages``:
+                up to three more of the ten codes that callers may switch to,
+                as a list (``["en-IN"]``) or a comma-separated string. Only
+                with a fixed ``language``: with ``"auto"``, or with a code
+                outside the list or more than three, it raises ``ValueError``.
             model: Shortcut for ``settings.model``. Defaults to ``"mira-stt"``.
             sample_rate: The rate audio is sent at. ``"auto"`` (the default)
                 sends 8 kHz audio as it is and resamples anything else to
@@ -392,7 +469,7 @@ class MiraiSTTService(STTService):
                 (the default; the first service starts the pool). ``False``
                 always connects and starts no pool.
             settings: Runtime-updatable settings; values here win over the
-                ``language``/``model`` shortcuts.
+                ``language``/``secondary_languages``/``model`` shortcuts.
             **kwargs: Passed through to :class:`STTService`, e.g.
                 ``audio_passthrough`` or ``ttfs_p99_latency``.
         """
@@ -417,6 +494,7 @@ class MiraiSTTService(STTService):
         default_settings = self.Settings(
             model=model,
             language=language,
+            secondary_languages=secondary_languages,
             stream_type=None,
             mode=None,
             threshold=None,
@@ -427,6 +505,9 @@ class MiraiSTTService(STTService):
         if settings is not None:
             default_settings.apply_update(settings)
         default_settings.language = stt_language(default_settings.language)
+        default_settings.secondary_languages = stt_secondary_languages(
+            default_settings.secondary_languages, default_settings.language
+        )
         kwargs.setdefault("ttfs_p99_latency", DEFAULT_TTFS_P99)
         super().__init__(settings=default_settings, **kwargs)
 
@@ -782,7 +863,12 @@ class MiraiSTTService(STTService):
 
     def _runtime(self) -> dict:
         """The settings an open socket can change with config.update, by query name."""
-        params: dict[str, Any] = {"language_code": self._settings.language}
+        language = self._settings.language
+        params: dict[str, Any] = {"language_code": language}
+        if language != AUTO_LANGUAGE:
+            secondary = [code for code in self._settings.secondary_languages or () if code != language]
+            if secondary:
+                params["secondary_languages"] = ",".join(secondary)
         for name in _RUNTIME_FIELDS:
             value = getattr(self._settings, name)
             if not is_given(value) or value is None:
@@ -875,7 +961,7 @@ class MiraiSTTService(STTService):
     async def _configure(self, sock: _Socket):
         """Bring a pooled socket's runtime settings to this session's, waiting for config.updated."""
         wanted = self._runtime()
-        change = {k: v for k, v in wanted.items() if sock.runtime.get(k) != v}
+        change = _runtime_change(sock.runtime, wanted)
         if not change:
             return
         await sock.websocket.send(json.dumps({"event": "config.update", **change}))
@@ -940,9 +1026,11 @@ class MiraiSTTService(STTService):
         self.connected_url = sock.url
         sock.reader = self.create_task(self._read(sock), name="mirai-stt-receive")
         replay = self._replay()
-        if sock.runtime != self._runtime():
-            replay.appendleft(_Out(json.dumps({"event": "config.update", **self._runtime()})))
-            sock.runtime = self._runtime()
+        runtime = self._runtime()
+        if sock.runtime != runtime:
+            update = {**runtime, **_runtime_change(sock.runtime, runtime)}
+            replay.appendleft(_Out(json.dumps({"event": "config.update", **update})))
+            sock.runtime = runtime
         replayed = sum(item.audio_bytes for item in replay)
         if replayed and self._connected_once:
             logger.info(f"{self}: replaying {self._seconds(replayed):.1f} s of audio not yet transcribed")
@@ -1312,7 +1400,11 @@ class MiraiSTTService(STTService):
         await self.push_error(error_msg=text, category=_ERROR_CATEGORIES.get(code, ErrorCategory.SERVER))
 
     def _frame_language(self, event: dict, spoken_in: str | None = None) -> Language | None:
-        code = event.get("language_code") or event.get("language") or spoken_in or self._settings.language
+        """The language a transcript was heard in: the event's own, else the one asked for.
+
+        ``None`` when that is ``"auto"`` and the event names none.
+        """
+        code = event.get("language") or event.get("language_code") or spoken_in or self._settings.language
         try:
             return Language(code)
         except ValueError:
@@ -1327,8 +1419,10 @@ class MiraiSTTService(STTService):
     async def _update_settings(self, delta: STTSettings) -> dict[str, Any]:
         """Language and tuning change on the open socket; model and prefix padding at the next pause.
 
-        A language Mirai doesn't transcribe (or ``"auto"``) is not sent: the
-        socket keeps its language and a warning says why.
+        A language Mirai doesn't transcribe is not sent: the socket keeps its
+        language and a warning says why. The same goes for secondary languages
+        that aren't valid, or that come with ``"auto"``; a change to ``"auto"``
+        clears the secondary languages.
         """
         if is_given(delta.language):
             try:
@@ -1336,6 +1430,16 @@ class MiraiSTTService(STTService):
             except ValueError as exc:
                 logger.warning(f"{self}: {exc}; keeping {self._settings.language}")
                 delta.language = NOT_GIVEN
+        language = delta.language if is_given(delta.language) else self._settings.language
+        secondary = getattr(delta, "secondary_languages", NOT_GIVEN)
+        if is_given(secondary):
+            try:
+                delta.secondary_languages = stt_secondary_languages(secondary, language)
+            except ValueError as exc:
+                logger.warning(f"{self}: {exc}; keeping {list(self._settings.secondary_languages or ())}")
+                delta.secondary_languages = NOT_GIVEN
+        if language == AUTO_LANGUAGE and not is_given(getattr(delta, "secondary_languages", NOT_GIVEN)):
+            self._settings.secondary_languages = ()  # auto already considers every language
         changed = await super()._update_settings(delta)
         if not changed or not self._started:
             return changed
@@ -1343,7 +1447,7 @@ class MiraiSTTService(STTService):
         self._build_urls()
         runtime = self._runtime()
         if self._sock is not None and runtime != before:
-            update = {k: v for k, v in runtime.items() if (before or {}).get(k) != v}
+            update = _runtime_change(before, runtime)
             self._queue(_Out(json.dumps({"event": "config.update", **update})))
             self._sock.runtime = runtime
         if changed.keys() & {"model", "prefix_padding_ms"} and self._sock is not None:
@@ -1385,6 +1489,19 @@ class MiraiSTTService(STTService):
 
 
 # ---------- helpers ----------
+
+
+def _runtime_change(before: dict | None, wanted: dict) -> dict[str, Any]:
+    """The ``config.update`` fields that take a socket from ``before`` to ``wanted``.
+
+    Secondary languages the socket has and ``wanted`` drops go as ``""``,
+    which clears them (and must travel with a change to ``auto``).
+    """
+    before = before or {}
+    change = {k: v for k, v in wanted.items() if before.get(k) != v}
+    if before.get("secondary_languages") and "secondary_languages" not in wanted:
+        change["secondary_languages"] = ""
+    return change
 
 
 def _fixed_query(

@@ -616,11 +616,157 @@ def test_a_language_mirai_does_not_transcribe_is_refused(given):
         MiraiSTTService(api_key=KEY, settings=MiraiSTTSettings(language=given))
 
 
-@pytest.mark.parametrize("given", ["auto", "AUTO", "unknown", "multi"])
-def test_auto_is_refused_because_there_is_no_language_detection(given):
-    with pytest.raises(ValueError, match="no language detection") as refused:
+@pytest.mark.parametrize("given", ["auto", "AUTO", " auto ", "unknown", "Unknown"])
+def test_auto_is_taken_and_sent_as_auto(given):
+    assert stt_module.stt_language(given) == "auto"
+    assert MiraiSTTService(api_key=KEY, language=given)._settings.language == "auto"
+    assert (
+        MiraiSTTService(api_key=KEY, settings=MiraiSTTSettings(language=given))._settings.language == "auto"
+    )
+
+
+@pytest.mark.parametrize("given", ["multi", "detect", "multilingual"])
+def test_other_providers_names_for_detection_point_to_auto(given):
+    with pytest.raises(ValueError, match="spells language detection 'auto'") as refused:
         MiraiSTTService(api_key=KEY, language=given)
     assert "gu-IN" in str(refused.value)
+
+
+@pytest.mark.parametrize(
+    "language, given, codes",
+    [
+        ("hi-IN", ["en-IN"], ("en-IN",)),
+        ("hi-IN", ["en", Language.GU, "EN-in"], ("en-IN", "gu-IN")),
+        ("hi-IN", "en-IN, gu", ("en-IN", "gu-IN")),
+        ("hi-IN", Language.TA_IN, ("ta-IN",)),
+        ("gu-IN", ("gu", "hi-IN"), ("hi-IN",)),  # the language itself is dropped
+        ("gu", ["hi", "en", "ta", "gu-IN"], ("hi-IN", "en-IN", "ta-IN")),  # three once it is
+        ("hi-IN", [], ()),
+        ("hi-IN", "", ()),
+        ("hi-IN", None, ()),
+        ("auto", [], ()),
+    ],
+)
+def test_secondary_languages_are_mirais_codes(language, given, codes):
+    assert stt_module.stt_secondary_languages(given, language) == codes
+    service = MiraiSTTService(api_key=KEY, language=language, secondary_languages=given)
+    assert service._settings.secondary_languages == codes
+    by_settings = MiraiSTTSettings(language=language, secondary_languages=given)
+    assert MiraiSTTService(api_key=KEY, settings=by_settings)._settings.secondary_languages == codes
+
+
+@pytest.mark.parametrize(
+    "language, given, message",
+    [
+        ("auto", ["en-IN"], "need a fixed language"),
+        ("unknown", "gu", "need a fixed language"),
+        ("hi-IN", ["en", "gu", "ta", "te"], "at most 3"),
+        ("hi-IN", ["fr"], "secondary_languages: language must be one of hi-IN"),
+        ("hi-IN", ["auto"], "secondary_languages: language must be one of"),
+        ("hi-IN", ["or-IN"], "secondary_languages"),
+    ],
+)
+def test_secondary_languages_mirai_does_not_take_are_refused(language, given, message):
+    with pytest.raises(ValueError, match=message):
+        MiraiSTTService(api_key=KEY, language=language, secondary_languages=given)
+
+
+async def test_auto_goes_on_the_socket_and_each_frame_carries_the_language_heard():
+    fake = FakeMiraiSTT(heard={440: "gu-IN", 880: "ta-IN"})
+    async with fake.serve() as url:
+        down, up = await call(
+            stt(url, endpointing="manual", language="auto"), [*utterance(440), *utterance(880)]
+        )
+    assert not errors_in(up)
+    (conn,) = fake.conns
+    assert conn.query["language_code"] == "auto" and "secondary_languages" not in conn.query
+    assert [f.language for f in finals(down)] == [Language.GU_IN, Language.TA_IN]
+    interims = [f for f in down if isinstance(f, InterimTranscriptionFrame)]
+    assert interims and {f.language for f in interims} <= {Language.GU_IN, Language.TA_IN}
+
+
+@pytest.mark.parametrize("field", ["language", "language_code"])
+async def test_secondary_languages_go_on_the_socket_and_the_frame_names_the_one_heard(field):
+    fake = FakeMiraiSTT(heard={880: "en-IN", 660: "ta-IN"}, language_field=field)
+    async with fake.serve() as url:
+        down, up = await call(
+            stt(url, endpointing="manual", language="hi", secondary_languages=["en", "gu"]),
+            [*utterance(440), *utterance(880), *utterance(660)],
+        )
+    assert not errors_in(up)
+    (conn,) = fake.conns
+    assert conn.query["language_code"] == "hi-IN"
+    assert conn.query["secondary_languages"] == "en-IN,gu-IN"
+    # 660 Hz "sounds" Tamil, which isn't on the list: the primary keeps it.
+    assert [f.language for f in finals(down)] == [Language.HI_IN, Language.EN_IN, Language.HI_IN]
+
+
+async def test_a_final_without_a_language_in_an_auto_session_has_none():
+    fake = FakeMiraiSTT(language_field="unused")
+    async with fake.serve() as url:
+        down, up = await call(stt(url, endpointing="manual", language="auto"), utterance(440))
+    assert not errors_in(up)
+    assert [f.language for f in finals(down)] == [None]
+
+
+async def test_a_waiting_socket_takes_auto_or_secondary_languages_by_config_update():
+    fake = FakeMiraiSTT()
+    async with fake.serve() as url:
+        await prewarm(api_key=KEY, connections=0, websocket=0, stt_websockets=1, stt_url=url)
+        service = stt(url, endpointing="manual", language="hi-IN", secondary_languages=["en-IN"])
+        _, up = await call(service, utterance(440))
+        assert not errors_in(up) and service.session_id == "sttws_1"
+        await asyncio.sleep(0.3)  # the pool opens a replacement
+        service = stt(url, endpointing="manual", language="auto")
+        _, up = await call(service, utterance(880))
+        assert not errors_in(up) and service.session_id == "sttws_2"
+    first, second = fake.conns[0], fake.conns[1]
+    assert first.query["language_code"] == second.query["language_code"] == "hi-IN"
+    assert first.events("config.update") == [{"event": "config.update", "secondary_languages": "en-IN"}]
+    assert second.events("config.update") == [{"event": "config.update", "language_code": "auto"}]
+
+
+async def test_language_and_secondary_languages_change_on_the_open_socket(logs):
+    fake = FakeMiraiSTT(heard={660: "en-IN", 880: "gu-IN", 440: "hi-IN"})
+    async with fake.serve() as url:
+        down, up = await call(
+            stt(url, endpointing="manual", language="hi-IN", secondary_languages=["en-IN"]),
+            [
+                *utterance(660),
+                SleepFrame(0.3),
+                # To auto: the secondary languages are cleared in the same update.
+                STTUpdateSettingsFrame(delta=MiraiSTTSettings(language="auto")),
+                SleepFrame(0.1),
+                *utterance(880),
+                SleepFrame(0.3),
+                # Not with auto: refused here and never sent.
+                STTUpdateSettingsFrame(delta=MiraiSTTSettings(secondary_languages=["hi-IN"])),
+                SleepFrame(0.1),
+                # Back to a fixed language, with a secondary language.
+                STTUpdateSettingsFrame(delta=MiraiSTTSettings(language="gu", secondary_languages="hi")),
+                SleepFrame(0.1),
+                *utterance(440),
+                SleepFrame(0.3),
+                # Only the list changes; [] clears it.
+                STTUpdateSettingsFrame(delta=MiraiSTTSettings(secondary_languages=[])),
+                SleepFrame(0.1),
+                *utterance(880),
+            ],
+        )
+    assert not errors_in(up)
+    (conn,) = fake.conns
+    assert conn.events("config.update") == [
+        {"event": "config.update", "language_code": "auto", "secondary_languages": ""},
+        {"event": "config.update", "language_code": "gu-IN", "secondary_languages": "hi-IN"},
+        {"event": "config.update", "secondary_languages": ""},
+    ]
+    assert [f.language for f in finals(down)] == [
+        Language.EN_IN,
+        Language.GU_IN,
+        Language.HI_IN,
+        Language.GU_IN,
+    ]
+    assert any(level == "WARNING" and "need a fixed language" in m for level, m in logs)
 
 
 async def test_a_bare_code_goes_on_the_socket_as_mirais_code():
@@ -641,7 +787,7 @@ async def test_a_language_update_is_normalised_and_an_unsupported_one_is_not_sen
             [
                 *utterance(440),
                 SleepFrame(0.2),
-                STTUpdateSettingsFrame(delta=MiraiSTTSettings(language="auto")),
+                STTUpdateSettingsFrame(delta=MiraiSTTSettings(language="multi")),
                 SleepFrame(0.1),
                 *utterance(660),
                 SleepFrame(0.3),
@@ -652,11 +798,12 @@ async def test_a_language_update_is_normalised_and_an_unsupported_one_is_not_sen
         )
     assert not errors_in(up)
     (conn,) = fake.conns
-    # "auto" never reaches the socket: it keeps its language. Language.TA goes as ta-IN.
+    # "multi" never reaches the socket: it keeps its language. Language.TA goes as ta-IN.
     assert conn.events("config.update") == [{"event": "config.update", "language_code": "ta-IN"}]
     assert [f.language.value for f in finals(down)] == ["hi-IN", "hi-IN", "ta-IN"]
     assert any(
-        level == "WARNING" and "no language detection" in m and "keeping hi-IN" in m for level, m in logs
+        level == "WARNING" and "spells language detection 'auto'" in m and "keeping hi-IN" in m
+        for level, m in logs
     )
 
 

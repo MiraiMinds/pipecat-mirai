@@ -19,7 +19,7 @@ from pipecat_mirai.stt import DEFAULT_STT_WEBSOCKET_URL, STT_LANGUAGES, MiraiSTT
 from pipecat_mirai.tts import VOICES, MiraiHttpTTSService, MiraiTTSSettings
 from pipecat_mirai.tts_websocket import DEFAULT_WEBSOCKET_URL, MiraiTTSService, MiraiWebsocketTTSService
 
-__version__ = "0.6.1"
+__version__ = "0.7.0"
 
 __all__ = [
     "DEFAULT_LEAD_SECS",
