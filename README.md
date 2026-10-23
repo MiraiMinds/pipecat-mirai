@@ -292,16 +292,39 @@ out as `InterimTranscriptionFrame`, and each utterance's final as one
 | Kannada | `kn-IN` |
 | Malayalam | `ml-IN` |
 
-Pass the language your callers speak. There is no automatic language detection,
-so `"auto"` is refused; the bare code (`"gu"`) or a Pipecat `Language` works
-too. Which languages are in production, beta or preview is on the
-[languages page](https://docs.miraiminds.co/v2/stt-languages).
+Pass the language your callers speak; the bare code (`"gu"`) or a Pipecat
+`Language` works too. Which languages are in production, beta or preview is on
+the [languages page](https://docs.miraiminds.co/v2/stt-languages).
+
+If you know the language, pass it: a fixed language is the most accurate and
+the fastest. When callers may switch between languages you know, add up to
+three `secondary_languages`. Your `language` stays the default, and an
+utterance moves to a secondary language only when Mirai is confident. Use
+`"auto"` only when you don't know the language: Mirai works out each
+utterance's language among the ten and remembers what it heard earlier in the
+call.
+
+```python
+stt = MiraiSTTService(language="hi-IN", secondary_languages=["en-IN"])  # Hindi, sometimes English
+stt = MiraiSTTService(language="gu-IN", secondary_languages=["hi-IN"])  # Gujarati, sometimes Hindi
+stt = MiraiSTTService(language="auto")                                  # any of the ten
+```
+
+In those sessions each `TranscriptionFrame` (and `InterimTranscriptionFrame`)
+has `language` set to the language Mirai heard, such as `Language.GU_IN`. An
+utterance that switches language can take a little longer to finalise.
+`secondary_languages` need a fixed `language`, so `"auto"` with them raises
+`ValueError`, as does a code outside the ten or more than three.
 
 Change the language mid-call with Pipecat's standard settings frame (it applies
-on the open socket):
+on the open socket from the next utterance; a change to `"auto"` clears the
+secondary languages):
 
 ```python
 await task.queue_frame(STTUpdateSettingsFrame(delta=MiraiSTTService.Settings(language="gu-IN")))
+await task.queue_frame(
+    STTUpdateSettingsFrame(delta=MiraiSTTService.Settings(secondary_languages=["hi-IN", "en-IN"]))
+)
 ```
 
 ### What it does for you
@@ -335,12 +358,13 @@ add up what Mirai billed for the sessions so far.
 | Argument | Default | |
 |---|---|---|
 | `api_key` | `$MIRAI_API_KEY` | Your Mirai API key |
-| `language` | `"hi-IN"` | One of the ten codes above |
+| `language` | `"hi-IN"` | One of the ten codes above, or `"auto"` |
+| `secondary_languages` | `None` | Up to three more of the ten that callers may switch to (fixed `language` only) |
 | `model` | `"mira-stt"` | Mirai's streaming speech-to-text model |
 | `sample_rate` | `"auto"` | `8000` or `16000` to force the rate sent |
 | `encoding` | `"auto"` (`linear16`) | `"mulaw"` / `"alaw"` at 8 kHz |
 | `endpointing` | `"auto"` | `"manual"` (your VAD) or `"vad"` (Mirai's) |
-| `settings` | `language="hi-IN"`, `model="mira-stt"` | `MiraiSTTService.Settings(...)`: `language`, `mode` (`"codemix"` keeps English words in Latin script), `stream_type`, and Mirai's VAD tuning |
+| `settings` | `language="hi-IN"`, `model="mira-stt"` | `MiraiSTTService.Settings(...)`: `language`, `secondary_languages`, `mode` (`"codemix"` keeps English words in Latin script), `stream_type`, and Mirai's VAD tuning |
 | `url` | `wss://sandbox.voice.miraiminds.co/v1/audio/transcriptions/stream` | Mirai's streaming endpoint |
 | `shared_pool` | `True` | Take a socket the process's pool opened ahead of need |
 
