@@ -542,3 +542,13 @@ async def test_a_pool_refused_by_the_edge_backs_off_instead_of_filling_the_gatew
         _, up = await ws_call(tts)
         assert not errors_in(up) and tts.connected_url == s.url
         assert len(s.delhi.handshakes) == 1
+
+
+async def test_with_the_gateway_down_calls_still_speak_from_mirais_edge(known_edge, logs):
+    # Delhi restarting (502 on every route) must not move calls off a healthy edge.
+    async with stack(gateway={"token_status": 502}, delhi={"refuse_status": 502}) as s:
+        known_edge(s)
+        results = await asyncio.gather(*(ws_call(ws_tts(s.url)) for _ in range(6)))
+        for _, up in results:
+            assert not errors_in(up)
+        assert s.delhi.handshakes == [] and len(s.edge.conns) >= 6
