@@ -28,6 +28,19 @@ All notable changes to this project are documented here. The format follows
   utterance in (the event's `language`, or `language_code`), and `None` when
   an `auto` transcript names none.
 
+## [0.6.2] - 2026-10-27
+
+### Changed
+
+- **No idle text-to-speech sockets when they are billed per minute.** Mirai now
+  bills a text-to-speech socket per minute it is open (₹0.90 a minute, idle
+  seconds included) and says so in `session.ready` (`billing.mode` is
+  `connected_minute`). When it does, the automatic socket pool keeps no socket
+  waiting, so you are not billed for sockets no call is using; each call opens
+  its own socket (about 100 ms more on its first sentence). `prewarm(websocket=M)`
+  and `MIRAI_WARM_WEBSOCKETS` still keep sockets waiting when you ask for them.
+  Workspaces billed per character keep the pool as before.
+
 ## [0.6.1] - 2026-10-19
 
 ### Fixed

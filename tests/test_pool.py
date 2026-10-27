@@ -360,6 +360,58 @@ async def test_the_first_websocket_service_sets_the_pool_going(monkeypatch):
         assert used == [1, 2, 3, 4]  # nothing beyond the four already open spoke
 
 
+PER_MINUTE = {"mode": "connected_minute", "paise_per_minute": 90}
+
+
+async def test_a_workspace_billed_per_minute_keeps_no_socket_waiting(monkeypatch):
+    # Every second a socket is open is billed, so none waits for a call: the
+    # pool's first sockets say so in session.ready and are closed at once.
+    monkeypatch.delenv("MIRAI_WARM_WEBSOCKETS")  # the automatic default
+    fake = FakeMiraiWS(ready_billing=PER_MINUTE)
+    async with fake.serve() as url:
+        await ws_call(ws_tts(url), [TTSSpeakFrame(TEXT), SleepFrame(1.3)])  # cold: connects itself
+        await asyncio.sleep(0.3)
+        opened = len(fake.conns)
+        assert 1 < opened <= 1 + pool_module.AUTO_WEBSOCKETS  # the pool tried, then stopped
+        (stats,) = shared_connection_stats()["websocket"]
+        assert (stats["ready"], stats["target"]) == (0, 0)
+        assert all(c.ws.state is State.CLOSED for c in fake.conns)  # nothing left open, so nothing billed
+        # The next call connects for itself and speaks as before.
+        down, up = await ws_call(ws_tts(url))
+        assert audio_of(down, 8000) == tone(0.5, 8000) and not errors_in(up)
+        await asyncio.sleep(0.3)
+        assert len(fake.conns) == opened + 1  # its own socket; the pool still keeps none
+
+
+async def test_prewarm_keeps_sockets_waiting_even_when_billed_per_minute(monkeypatch):
+    # prewarm() is the caller's own choice, made knowing what waiting costs.
+    monkeypatch.delenv("MIRAI_WARM_WEBSOCKETS")
+    fake = FakeMiraiWS(ready_billing=PER_MINUTE)
+    async with fake.serve() as url:
+        result = await prewarm(api_key=KEY, connections=0, websocket=2, websocket_url=url)
+        assert (result.websockets, result.errors) == (2, [])
+        (stats,) = shared_connection_stats()["websocket"]
+        assert (stats["ready"], stats["target"]) == (2, 2)
+
+
+async def test_mirai_warm_websockets_keeps_sockets_waiting_even_when_billed_per_minute(monkeypatch):
+    monkeypatch.setenv("MIRAI_WARM_WEBSOCKETS", "1")
+    fake = FakeMiraiWS(ready_billing=PER_MINUTE)
+    async with fake.serve() as url:
+        await ws_call(ws_tts(url), [TTSSpeakFrame(TEXT), SleepFrame(1.3)])
+        (stats,) = shared_connection_stats()["websocket"]
+        assert (stats["ready"], stats["target"]) == (1, 1)
+
+
+async def test_a_workspace_billed_per_character_still_keeps_sockets_waiting(monkeypatch):
+    monkeypatch.delenv("MIRAI_WARM_WEBSOCKETS")
+    fake = FakeMiraiWS(ready_billing={"mode": "chars", "paise_per_1k_chars": 180})
+    async with fake.serve() as url:
+        await ws_call(ws_tts(url), [TTSSpeakFrame(TEXT), SleepFrame(1.3)])
+        (stats,) = shared_connection_stats()["websocket"]
+        assert stats["ready"] == stats["target"] == pool_module.AUTO_WEBSOCKETS
+
+
 async def test_pipelines_starting_together_never_share_a_socket():
     fake = FakeMiraiWS(seconds=1.0)
     async with fake.serve() as url:
