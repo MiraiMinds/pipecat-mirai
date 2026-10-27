@@ -6,6 +6,11 @@
 
 """Mirai text-to-speech, speech-to-text and Realtime API for Pipecat."""
 
+from pipecat_mirai._logging import forward_to_loguru
+
+forward_to_loguru()
+
+# ruff: noqa: E402
 from pipecat_mirai.pacing import DEFAULT_LEAD_SECS, apply_output_lead
 from pipecat_mirai.pool import close_shared_connections, shared_connection_stats
 from pipecat_mirai.prewarm import PrewarmResult, prewarm
@@ -19,7 +24,7 @@ from pipecat_mirai.stt import DEFAULT_STT_WEBSOCKET_URL, STT_LANGUAGES, MiraiSTT
 from pipecat_mirai.tts import VOICES, MiraiHttpTTSService, MiraiTTSSettings
 from pipecat_mirai.tts_websocket import DEFAULT_WEBSOCKET_URL, MiraiTTSService, MiraiWebsocketTTSService
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 __all__ = [
     "DEFAULT_LEAD_SECS",

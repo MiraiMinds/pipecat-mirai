@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pipecat-mirai"
-version = "0.7.0"
+version = "0.8.0"
 description = "Mirai text-to-speech, speech-to-text and Realtime API for Pipecat voice agents in Hindi, Hinglish, Gujarati and other Indian languages"
 readme = "README.md"
 license = "BSD-2-Clause"
@@ -20,6 +20,7 @@ classifiers = [
     "Topic :: Multimedia :: Sound/Audio :: Speech",
 ]
 dependencies = [
+    "fourier-frequency==0.8.0",
     "pipecat-ai>=1.8.1,<1.13",
     "httpx>=0.27,<1",
     "numpy>=1.26",
@@ -39,6 +40,12 @@ dev = [
     "pytest-asyncio>=0.23",
     "ruff>=0.6",
 ]
+
+[tool.uv.workspace]
+members = ["packages/fourier-frequency"]
+
+[tool.uv.sources]
+fourier-frequency = { workspace = true }
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pipecat_mirai"]

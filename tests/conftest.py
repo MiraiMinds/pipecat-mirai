@@ -1,6 +1,5 @@
 import pytest
-
-from pipecat_mirai import edge as edge_module
+from fourier_frequency import edge as edge_module
 
 
 @pytest.fixture(autouse=True)
