@@ -518,20 +518,22 @@ def bot_main(a):
             apply_output_lead(transport, a.lead)
         tts = make_tts()
         is_ws = isinstance(tts, MiraiWsTTS)
-        info["endpoint"] = info["endpoint"] or getattr(tts, "_url" if is_ws else "_speech_url", None)
-        if is_ws and hasattr(tts, "_on_audio_start") and hasattr(tts, "_retry_later"):
-            on_audio_start, retry_later = tts._on_audio_start, tts._retry_later
+        # The engine (fourier-frequency) under the service, since 0.8; the service itself before.
+        engine = getattr(tts, "stream", None) or getattr(tts, "_engine", None) or tts
+        info["endpoint"] = info["endpoint"] or getattr(engine, "_url" if is_ws else "_speech_url", None)
+        if is_ws and hasattr(engine, "_on_audio_start") and hasattr(engine, "_retry_later"):
+            on_audio_start, retry_later = engine._on_audio_start, engine._retry_later
 
             async def audio_start(event):
                 await on_audio_start(event)
-                if tts._sentence is not None and tts._sentence.turn is not None:
+                if engine._sentence is not None and engine._sentence.turn is not None:
                     call["audio_starts"].append((time.monotonic(), event.get("text") or ""))
 
             async def retry(*args, **kwargs):
                 call["retries"] += 1
                 await retry_later(*args, **kwargs)
 
-            tts._on_audio_start, tts._retry_later = audio_start, retry
+            engine._on_audio_start, engine._retry_later = audio_start, retry
         up, down = Tap(call), Tap(call)
         output = outputs[label] = transport.output()
         worker = PipelineWorker(

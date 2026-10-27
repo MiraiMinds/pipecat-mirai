@@ -10,11 +10,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
-      - name: Check tag matches version
+      - name: Check tag matches both versions
         run: |
-          VERSION=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
-          test "v$VERSION" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != v$VERSION"; exit 1; }
-      - run: uv build
+          for project in pyproject.toml packages/fourier-frequency/pyproject.toml; do
+            VERSION=$(grep -m1 '^version = ' $project | cut -d'"' -f2)
+            test "v$VERSION" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != v$VERSION ($project)"; exit 1; }
+          done
+          grep -q "\"fourier-frequency==${GITHUB_REF_NAME#v}\"" pyproject.toml || { echo "pipecat-mirai must pin fourier-frequency==${GITHUB_REF_NAME#v}"; exit 1; }
+      # Both packages, released together: pipecat-mirai X.Y.Z pins fourier-frequency X.Y.Z.
+      - run: uv build --package fourier-frequency --out-dir dist
+      - run: uv build --package pipecat-mirai --out-dir dist
       - uses: actions/upload-artifact@v4
         with:
           name: dist

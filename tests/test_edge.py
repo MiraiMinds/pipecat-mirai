@@ -53,7 +53,7 @@ def logs():
 @pytest.fixture
 def edge_warnings(logs):
     """The edge's warnings so far."""
-    return lambda: [m for level, name, m in logs if level == "WARNING" and name == "pipecat_mirai.edge"]
+    return lambda: [m for level, name, m in logs if level == "WARNING" and name == "fourier_frequency.edge"]
 
 
 def closed_port_url() -> str:

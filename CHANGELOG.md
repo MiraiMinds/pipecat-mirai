@@ -4,6 +4,80 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] - Unreleased
+
+### Added
+
+- **`fourier-frequency`, the engine without Pipecat.** A second package from
+  this repo (`packages/fourier-frequency`, `pip install fourier-frequency`)
+  holds everything that isn't Pipecat: the sockets, Mirai's edge, the
+  process-wide pools, `prewarm()`, reconnects, resends and replays, 429 and
+  capacity retries, the HTTP fallback, resampling and G.711. Its
+  `TTSStream` (with `TTSTurn` per reply), `HttpTTS` and `STTStream` give any
+  Python orchestrator what the Pipecat services have; `Pacer` paces speech
+  into a phone media stream 0.4 s ahead. Depends on httpx, websockets, numpy
+  and soxr only, logs to the standard library's `fourier_frequency` logger,
+  and reports errors as `FrequencyError` (category, code, request id,
+  permanent). Examples: `01-speak.py`, and `02-phone-bridge.py`, a Twilio
+  Media Streams agent with barge-in. Both packages are released together;
+  pipecat-mirai pins the same version.
+
+### Changed
+
+- `MiraiTTSService`, `MiraiHttpTTSService` and `MiraiSTTService` are now
+  adapters over `TTSStream`, `HttpTTS` and `STTStream` (on the WebSocket
+  services, `service.stream` is the engine). Constructor arguments, frames,
+  metrics, errors and event handlers are as before. `MiraiTTSService` is a `TTSService` with its own
+  reconnect loop (three tries, 4 to 10 s apart, as Pipecat's), not a
+  `WebsocketTTSService`; `reconnect_on_error` is still accepted.
+- **Pipecat 1.13 and 1.14 are supported** (`pipecat-ai>=1.8.1,<1.15`): the
+  1.13 breakage was in Pipecat's websocket reconnect, which the services no
+  longer use.
+- `pipecat_mirai.pool`, `.edge`, `._net` and `.prewarm` are the
+  `fourier_frequency` modules of the same name. Patch module constants there
+  (`fourier_frequency.tts.CONNECT_RETRY_SECS`, ...): the copies re-exported
+  from `pipecat_mirai.tts`/`.stt` don't steer the engine. Engine log lines
+  keep their text and reach loguru as before, under `fourier_frequency.*`.
+- A failed HTTP sentence's `ErrorFrame.exception` is a `FrequencyError`
+  (`MiraiTTSError` is now that class), with the original error as its cause.
+
+## [0.7.0] - Unreleased
+
+### Added
+
+- **Automatic language identification in `MiraiSTTService`.**
+  `language="auto"` (or `"unknown"`) is now accepted and sent as
+  `language_code=auto`: Mirai works out each utterance's language among the
+  ten and remembers what it heard earlier in the session. Other providers'
+  names for detection (`"multi"`, `"detect"`, `"multilingual"`) still raise
+  `ValueError`, now pointing to `"auto"`.
+- **`secondary_languages`** on `MiraiSTTService` and `MiraiSTTService.Settings`:
+  up to three more of the ten codes that callers may switch to, with a fixed
+  `language` (a list, or a comma-separated string). Codes are validated like
+  `language` (any case, bare codes, Pipecat `Language`); duplicates and the
+  primary are dropped; `"auto"` with secondary languages, a code outside the
+  ten or more than three raise `ValueError` (a runtime update with them is not
+  sent and is logged as a warning). They go on the socket as
+  `secondary_languages=en-IN,gu-IN` and change on the open socket with
+  `config.update`; a change to `"auto"` clears them in the same update.
+- In an `auto` or secondary-language session, `TranscriptionFrame.language`
+  and `InterimTranscriptionFrame.language` are the language Mirai heard that
+  utterance in (the event's `language`, or `language_code`), and `None` when
+  an `auto` transcript names none.
+
+## [0.6.2] - 2026-10-27
+
+### Changed
+
+- **No idle text-to-speech sockets when they are billed per minute.** Mirai now
+  bills a text-to-speech socket per minute it is open (₹0.90 a minute, idle
+  seconds included) and says so in `session.ready` (`billing.mode` is
+  `connected_minute`). When it does, the automatic socket pool keeps no socket
+  waiting, so you are not billed for sockets no call is using; each call opens
+  its own socket (about 100 ms more on its first sentence). `prewarm(websocket=M)`
+  and `MIRAI_WARM_WEBSOCKETS` still keep sockets waiting when you ask for them.
+  Workspaces billed per character keep the pool as before.
+
 ## [0.6.1] - 2026-10-19
 
 ### Fixed

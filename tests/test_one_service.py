@@ -3,11 +3,12 @@
 import httpx
 import pytest
 from fake_mirai_ws import FakeMiraiWS, tone
+from fourier_frequency import tts as core_tts
 from pipecat.frames.frames import ErrorFrame, TTSSpeakFrame
 from test_tts_websocket import TEXT, audio_of, run
 
 import pipecat_mirai
-from pipecat_mirai import MiraiHttpTTSService, MiraiTTSService, MiraiWebsocketTTSService, tts_websocket
+from pipecat_mirai import MiraiHttpTTSService, MiraiTTSService, MiraiWebsocketTTSService
 from pipecat_mirai.tts_websocket import _stream_url
 
 
@@ -83,7 +84,7 @@ async def test_a_socket_refused_with_429_is_retried_before_the_call_gives_up():
 
 
 async def test_a_lasting_429_is_still_reported(monkeypatch):
-    monkeypatch.setattr(tts_websocket, "CONNECT_RETRY_SECS", 0.5)
+    monkeypatch.setattr(core_tts, "CONNECT_RETRY_SECS", 0.5)
     fake = FakeMiraiWS(refuse_status=429)
     async with fake.serve() as url:
         tts = MiraiTTSService(api_key="sk_test", url=url, shared_pool=False, edge=False, http_fallback=False)

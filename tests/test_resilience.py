@@ -4,6 +4,7 @@ import asyncio
 
 import pytest
 from fake_mirai_ws import FakeMiraiWS
+from fourier_frequency import tts as tts_module
 from pipecat.frames.frames import (
     InterruptionFrame,
     LLMFullResponseEndFrame,
@@ -20,7 +21,6 @@ from pipecat.tests.utils import SleepFrame, run_test
 from test_tts import TEXT, FakeMirai, Recorder, audio_of, errors_in, speak, tone
 
 from pipecat_mirai import MiraiHttpTTSService, MiraiWebsocketTTSService, close_shared_connections
-from pipecat_mirai import tts as tts_module
 
 KEY = "sk_test"
 

@@ -20,12 +20,30 @@ jobs:
         run: |
           uv venv --python ${{ matrix.python }}
           if [ "${{ matrix.pipecat }}" = "latest" ]; then PIPECAT="pipecat-ai[websocket]"; else PIPECAT="pipecat-ai[websocket]==${{ matrix.pipecat }}"; fi
-          uv pip install -e . "$PIPECAT" pytest pytest-asyncio ruff
+          uv pip install -e packages/fourier-frequency -e . "$PIPECAT" pytest pytest-asyncio ruff
       - name: Lint
         run: |
           .venv/bin/ruff check .
-          .venv/bin/ruff format --check src tests examples benchmarks
+          .venv/bin/ruff format --check src tests examples benchmarks packages
       - name: Test
         run: .venv/bin/python -m pytest -q
       - name: Examples compile
         run: .venv/bin/python -m py_compile examples/foundational/*.py examples/phone/*.py benchmarks/phone-breaks/phone_breaks.py benchmarks/stt-e2e/run.py
+
+  core:
+    # fourier-frequency on its own: no Pipecat installed, so an accidental import fails here.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install fourier-frequency alone
+        run: |
+          uv venv --python ${{ matrix.python }}
+          uv pip install -e packages/fourier-frequency pytest pytest-asyncio
+          if .venv/bin/python -c "import pipecat" 2>/dev/null; then echo "pipecat is installed"; exit 1; fi
+      - name: Test
+        run: .venv/bin/python -m pytest -q tests/core

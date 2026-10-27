@@ -159,8 +159,17 @@ pipeline = Pipeline([
 <ParamField path="language" type="str | Language" default="hi-IN">
   The language your callers speak: `hi-IN` (Hindi and Hinglish), `en-IN`, `gu-IN`,
   `mr-IN`, `pa-IN`, `bn-IN`, `ta-IN`, `te-IN`, `kn-IN` or `ml-IN`. Any case, the bare
-  code (`gu`) or a Pipecat `Language` works too. There is no automatic language
-  detection, so `auto` is refused. Changes on the open socket.
+  code (`gu`) or a Pipecat `Language` works too. `"auto"` has Mirai work out each
+  utterance's language among the ten; use it only when you don't know the language,
+  since a fixed one is the most accurate and the fastest. Changes on the open socket.
+</ParamField>
+
+<ParamField path="secondary_languages" type="list[str] | str" default="None">
+  Up to three more of the ten codes that callers may switch to, such as `["en-IN"]`
+  with `language="hi-IN"`. `language` stays the default and an utterance moves to a
+  secondary language only when Mirai is confident. Needs a fixed `language`. In an
+  `"auto"` or secondary-language session, each transcription frame's `language` is
+  the language Mirai heard.
 </ParamField>
 
 <ParamField path="model" type="str" default="mira-stt">
@@ -194,7 +203,7 @@ pipeline = Pipeline([
 </ParamField>
 
 <ParamField path="settings" type="MiraiSTTSettings" default="None">
-  Runtime-updatable settings: `language`, `model`, `stream_type` (`"fast"` or
+  Runtime-updatable settings: `language`, `secondary_languages`, `model`, `stream_type` (`"fast"` or
   `"balanced"`), `mode` (`"transcribe"` or `"codemix"`) and, with Mirai's VAD,
   `threshold`, `silence_duration_ms`, `min_speech_duration_ms` and `prefix_padding_ms`.
 </ParamField>

@@ -21,6 +21,12 @@ Telugu, and speech-to-text in ten Indian languages.
   it to your output transport for you; call it yourself only for another TTS
   vendor.
 
+**Not on Pipecat?** The engine under `MiraiTTSService` and `MiraiSTTService`
+is its own package,
+[`fourier-frequency`](packages/fourier-frequency/README.md) (`pip install
+fourier-frequency`): the same sockets, edge routing, pools, reconnects and
+retries for any Python orchestrator, with no framework dependency.
+
 ## Installation
 
 ```bash
@@ -105,7 +111,10 @@ the whole call over it, so no sentence waits for a connection.
 - **Metrics.** Time to first byte is measured at the first audio byte of each
   reply; usage metrics are the characters Mirai billed. Pipecat tracing works.
 
-Billing is per character, as on Mirai's HTTP endpoint.
+Billing: a socket is billed per minute it is open, at ₹0.90 a minute, counted
+per second and idle seconds included, with the speech it carries included.
+Workspaces Mirai bills per character instead (as on the HTTP endpoint) are
+told so in `session.ready`, and so is the service.
 
 ### Parameters
 
@@ -144,7 +153,9 @@ Mirai sets two limits per workspace, shared by every process that uses your key
   to 3 s), which shows up as a longer time to first byte, and past that the
   service reports `at_capacity`.
 - **Open sockets.** One per live call, plus the few each process keeps waiting
-  (2, or the recent peak of calls plus 2).
+  (2, or the recent peak of calls plus 2) when your sockets are billed per
+  character. Billed per minute, none wait unless you ask (`prewarm()`,
+  `MIRAI_WARM_WEBSOCKETS`).
 
 If you plan a load test with more than 10 calls starting together, tell us the
 number and we raise your workspace's limits before you start.
@@ -234,7 +245,11 @@ Nothing else changes: the services find the connections on their own.
   so the call starts without a handshake, and the pool opens a replacement in
   the background. A socket belongs to one call and is closed when that call
   ends, never handed to another. If no socket is waiting, the service connects
-  as it always has. Waiting sockets are never billed.
+  as it always has. When your sockets are billed per minute (the default, ₹0.90
+  a minute), a waiting socket is billed like any open one, so the automatic pool
+  keeps none: each call opens its own socket, about 100 ms more on its first
+  sentence. `prewarm(websocket=M)` and `MIRAI_WARM_WEBSOCKETS` still keep M
+  waiting if that time is worth it to you.
 
 One process pays the handshakes once, at start-up, and its calls reuse them
 from then on. Several worker processes each have their own pool (connections
@@ -292,16 +307,39 @@ out as `InterimTranscriptionFrame`, and each utterance's final as one
 | Kannada | `kn-IN` |
 | Malayalam | `ml-IN` |
 
-Pass the language your callers speak. There is no automatic language detection,
-so `"auto"` is refused; the bare code (`"gu"`) or a Pipecat `Language` works
-too. Which languages are in production, beta or preview is on the
-[languages page](https://docs.miraiminds.co/v2/stt-languages).
+Pass the language your callers speak; the bare code (`"gu"`) or a Pipecat
+`Language` works too. Which languages are in production, beta or preview is on
+the [languages page](https://docs.miraiminds.co/v2/stt-languages).
+
+If you know the language, pass it: a fixed language is the most accurate and
+the fastest. When callers may switch between languages you know, add up to
+three `secondary_languages`. Your `language` stays the default, and an
+utterance moves to a secondary language only when Mirai is confident. Use
+`"auto"` only when you don't know the language: Mirai works out each
+utterance's language among the ten and remembers what it heard earlier in the
+call.
+
+```python
+stt = MiraiSTTService(language="hi-IN", secondary_languages=["en-IN"])  # Hindi, sometimes English
+stt = MiraiSTTService(language="gu-IN", secondary_languages=["hi-IN"])  # Gujarati, sometimes Hindi
+stt = MiraiSTTService(language="auto")                                  # any of the ten
+```
+
+In those sessions each `TranscriptionFrame` (and `InterimTranscriptionFrame`)
+has `language` set to the language Mirai heard, such as `Language.GU_IN`. An
+utterance that switches language can take a little longer to finalise.
+`secondary_languages` need a fixed `language`, so `"auto"` with them raises
+`ValueError`, as does a code outside the ten or more than three.
 
 Change the language mid-call with Pipecat's standard settings frame (it applies
-on the open socket):
+on the open socket from the next utterance; a change to `"auto"` clears the
+secondary languages):
 
 ```python
 await task.queue_frame(STTUpdateSettingsFrame(delta=MiraiSTTService.Settings(language="gu-IN")))
+await task.queue_frame(
+    STTUpdateSettingsFrame(delta=MiraiSTTService.Settings(secondary_languages=["hi-IN", "en-IN"]))
+)
 ```
 
 ### What it does for you
@@ -335,12 +373,13 @@ add up what Mirai billed for the sessions so far.
 | Argument | Default | |
 |---|---|---|
 | `api_key` | `$MIRAI_API_KEY` | Your Mirai API key |
-| `language` | `"hi-IN"` | One of the ten codes above |
+| `language` | `"hi-IN"` | One of the ten codes above, or `"auto"` |
+| `secondary_languages` | `None` | Up to three more of the ten that callers may switch to (fixed `language` only) |
 | `model` | `"mira-stt"` | Mirai's streaming speech-to-text model |
 | `sample_rate` | `"auto"` | `8000` or `16000` to force the rate sent |
 | `encoding` | `"auto"` (`linear16`) | `"mulaw"` / `"alaw"` at 8 kHz |
 | `endpointing` | `"auto"` | `"manual"` (your VAD) or `"vad"` (Mirai's) |
-| `settings` | `language="hi-IN"`, `model="mira-stt"` | `MiraiSTTService.Settings(...)`: `language`, `mode` (`"codemix"` keeps English words in Latin script), `stream_type`, and Mirai's VAD tuning |
+| `settings` | `language="hi-IN"`, `model="mira-stt"` | `MiraiSTTService.Settings(...)`: `language`, `secondary_languages`, `mode` (`"codemix"` keeps English words in Latin script), `stream_type`, and Mirai's VAD tuning |
 | `url` | `wss://sandbox.voice.miraiminds.co/v1/audio/transcriptions/stream` | Mirai's streaming endpoint |
 | `shared_pool` | `True` | Take a socket the process's pool opened ahead of need |
 
@@ -460,9 +499,10 @@ p50 422 ms, p95 641 ms after the greeting
 
 ## Compatibility
 
-Tested with Pipecat 1.8.1 and 1.12.0 on Python 3.11–3.12. Pipecat 1.13 is not
-supported yet: when a socket drops mid-reply, its reconnect loses that reply,
-so the package installs Pipecat below 1.13. `apply_output_lead` changes how
+Tested with Pipecat 1.8.1, 1.12.0, 1.13.0 and 1.14.0 on Python 3.11–3.13.
+Since 0.8.0 the services keep their own sockets (in `fourier-frequency`) instead
+of leaning on Pipecat's websocket reconnect, which is what broke under 1.13.
+`apply_output_lead` changes how
 Pipecat's websocket output transports time their writes. A test in this repo
 fails if a new Pipecat release changes that, and the function logs a warning and
 does nothing for transports it doesn't support.
