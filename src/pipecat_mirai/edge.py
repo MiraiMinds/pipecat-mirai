@@ -6,8 +6,7 @@
 
 """Moved to :mod:`fourier_frequency.edge`; this name is that same module."""
 
+import importlib
 import sys
 
-from fourier_frequency import edge as _module
-
-sys.modules[__name__] = _module
+sys.modules[__name__] = importlib.import_module("fourier_frequency.edge")

@@ -21,6 +21,12 @@ Telugu, and speech-to-text in ten Indian languages.
   it to your output transport for you; call it yourself only for another TTS
   vendor.
 
+**Not on Pipecat?** The engine under `MiraiTTSService` and `MiraiSTTService`
+is its own package,
+[`fourier-frequency`](packages/fourier-frequency/README.md) (`pip install
+fourier-frequency`): the same sockets, edge routing, pools, reconnects and
+retries for any Python orchestrator, with no framework dependency.
+
 ## Installation
 
 ```bash
@@ -493,9 +499,10 @@ p50 422 ms, p95 641 ms after the greeting
 
 ## Compatibility
 
-Tested with Pipecat 1.8.1 and 1.12.0 on Python 3.11–3.12. Pipecat 1.13 is not
-supported yet: when a socket drops mid-reply, its reconnect loses that reply,
-so the package installs Pipecat below 1.13. `apply_output_lead` changes how
+Tested with Pipecat 1.8.1, 1.12.0, 1.13.0 and 1.14.0 on Python 3.11–3.13.
+Since 0.8.0 the services keep their own sockets (in `fourier-frequency`) instead
+of leaning on Pipecat's websocket reconnect, which is what broke under 1.13.
+`apply_output_lead` changes how
 Pipecat's websocket output transports time their writes. A test in this repo
 fails if a new Pipecat release changes that, and the function logs a warning and
 does nothing for transports it doesn't support.

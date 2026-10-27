@@ -6,6 +6,7 @@ import json
 import numpy as np
 import pytest
 from fake_mirai_stt import FakeMiraiSTT, alaw2lin, dominant_hz, ulaw2lin
+from fourier_frequency import stt as core_stt
 from loguru import logger
 from pipecat.frames.frames import (
     ErrorFrame,
@@ -379,7 +380,7 @@ async def test_429_is_retried_before_it_is_reported():
 
 
 async def test_a_server_at_capacity_for_long_is_reported(monkeypatch):
-    monkeypatch.setattr(stt_module, "CONNECT_RETRY_SECS", 0.5)
+    monkeypatch.setattr(core_stt, "CONNECT_RETRY_SECS", 0.5)
     fake = FakeMiraiSTT(refuse_status=429)
     async with fake.serve() as url:
         service = stt(url, endpointing="manual")
@@ -400,7 +401,7 @@ async def test_a_missing_final_does_not_hang_the_call():
 
 
 async def test_a_quiet_socket_gets_a_ping_and_a_little_silence(monkeypatch):
-    monkeypatch.setattr(stt_module, "KEEPALIVE_SECS", 0.2)
+    monkeypatch.setattr(core_stt, "KEEPALIVE_SECS", 0.2)
     fake = FakeMiraiSTT()
     async with fake.serve() as url:
         await call(stt(url, endpointing="manual"), [SleepFrame(0.9)])
@@ -820,7 +821,7 @@ async def test_what_mirai_billed_is_summed_from_session_end():
 
 def test_the_key_is_never_in_the_url():
     service = MiraiSTTService(api_key=KEY)
-    service._wire_rate, service._endpointing = 8000, "manual"
-    service._build_urls()
-    assert KEY not in service._url and KEY not in service._pool_url
-    assert json.dumps(stt_module.stt_query(service._url)).find(KEY) == -1
+    service.stream._wire_rate, service.stream._endpointing = 8000, "manual"
+    service.stream._build_urls()
+    assert KEY not in service.stream._url and KEY not in service.stream._pool_url
+    assert json.dumps(stt_module.stt_query(service.stream._url)).find(KEY) == -1
