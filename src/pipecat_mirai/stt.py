@@ -39,6 +39,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse
 
 import numpy as np
 import soxr
+from fourier_frequency.audio import lin2alaw, lin2ulaw
 from loguru import logger
 from pipecat.frames.frames import (
     CancelFrame,
@@ -1627,24 +1628,3 @@ async def _close_quietly(websocket):
         await websocket.close()
     except Exception as exc:
         logger.debug(f"error closing a Mirai socket: {exc!r}")
-
-
-def lin2ulaw(pcm: np.ndarray) -> np.ndarray:
-    """16-bit PCM to G.711 mu-law bytes."""
-    x = pcm.astype(np.int32)
-    sign = (x < 0).astype(np.int32) << 7
-    magnitude = np.minimum(np.abs(x), 32635) + 0x84
-    exponent = np.clip(np.floor(np.log2(magnitude)).astype(np.int32) - 7, 0, 7)
-    mantissa = (magnitude >> (exponent + 3)) & 0x0F
-    return (~(sign | (exponent << 4) | mantissa) & 0xFF).astype(np.uint8)
-
-
-def lin2alaw(pcm: np.ndarray) -> np.ndarray:
-    """16-bit PCM to G.711 A-law bytes."""
-    x = pcm.astype(np.int32)
-    sign = (x >= 0).astype(np.int32) << 7
-    magnitude = np.where(x < 0, -x - 1, x) >> 3  # 13-bit magnitude, 0..4095
-    segment = np.where(magnitude >= 32, np.floor(np.log2(np.maximum(magnitude, 1))).astype(np.int32) - 4, 0)
-    shift = np.maximum(segment, 1)
-    mantissa = (magnitude >> shift) & 0x0F
-    return ((sign | (segment << 4) | mantissa) ^ 0x55).astype(np.uint8)
