@@ -328,7 +328,7 @@ async def test_interruption_cancels_once_and_nothing_leaks_into_the_next_context
         tts = ws_tts(url)
         # What the service itself hands Pipecat, and when it cancelled.
         appended, cancelled = [], []
-        append, cancel_turn = tts.append_to_audio_context, tts._cancel_turn
+        append, cancel_turn = tts.append_to_audio_context, tts.stream._cancel_turn
 
         async def spy_append(context_id, frame):
             appended.append((time.monotonic(), context_id, frame))
@@ -338,7 +338,7 @@ async def test_interruption_cancels_once_and_nothing_leaks_into_the_next_context
             cancelled.append(time.monotonic())
             await cancel_turn(turn)
 
-        tts.append_to_audio_context, tts._cancel_turn = spy_append, spy_cancel
+        tts.append_to_audio_context, tts.stream._cancel_turn = spy_append, spy_cancel
         rec, _, up = await run(
             tts,
             8000,
@@ -516,9 +516,9 @@ async def test_text_sent_on_a_dead_socket_is_resent_on_a_new_one(settle):
         tts = ws_tts(url)
 
         async def kill_on_first_text():
-            while tts._websocket is None:
+            while tts.stream._websocket is None:
                 await asyncio.sleep(0.005)
-            ws = tts._websocket
+            ws = tts.stream._websocket
             real_send = ws.send
 
             async def send(message):
@@ -549,11 +549,11 @@ async def test_a_dead_socket_found_by_a_send_settles_the_reply_on_it():
     async with fake.serve() as url:
         tts = ws_tts(url)
         release = asyncio.Event()
-        on_audio_start = tts._on_audio_start
+        on_audio_start = tts.stream._on_audio_start
 
         async def die_while_busy(event):
             if not release.is_set():
-                tts._websocket.transport.abort()
+                tts.stream._websocket.transport.abort()
                 await release.wait()
             await on_audio_start(event)
 
@@ -561,7 +561,7 @@ async def test_a_dead_socket_found_by_a_send_settles_the_reply_on_it():
             await asyncio.sleep(0.6)
             release.set()
 
-        tts._on_audio_start = die_while_busy
+        tts.stream._on_audio_start = die_while_busy
         releaser = asyncio.create_task(release_later())
         _, down, up = await run(
             tts, 8000, [TTSSpeakFrame(first), SleepFrame(0.2), TTSSpeakFrame(second), SleepFrame(1.0)]
