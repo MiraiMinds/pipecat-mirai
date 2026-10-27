@@ -681,6 +681,18 @@ STT_PROTOCOL = SocketProtocol(
 PROTOCOLS = {"tts": TTS_PROTOCOL, "stt": STT_PROTOCOL}
 
 
+def billed_per_minute(ready: dict) -> bool:
+    """Whether a ``session.ready`` says every second the socket is open is billed.
+
+    Mirai bills a text-to-speech socket per connected minute, idle seconds
+    included, unless the workspace is billed per character; ``session.ready``
+    says which (``billing.mode``). A socket kept waiting for a call costs
+    money on the first, so the pool keeps none (:meth:`WebsocketPool.target`).
+    """
+    billing = ready.get("billing") if isinstance(ready, dict) else None
+    return isinstance(billing, dict) and billing.get("mode") == "connected_minute"
+
+
 @dataclass(eq=False)
 class PooledWebsocket:
     """An open, authenticated socket that has had ``session.ready`` (``session.begin`` for STT)."""
@@ -754,6 +766,10 @@ class WebsocketPool:
         self.protocol = protocol
         self.floor: int | None = None
         self.auto = False
+        # Set when a socket's session.ready says the workspace pays for every
+        # second a socket is open (billing.mode connected_minute): from then on
+        # nothing waits unless the caller asked for it (prewarm() or warm_env).
+        self.per_minute = False
         self.peak = _Peak()
         self.ready: list[PooledWebsocket] = []
         self.opening = 0
@@ -782,6 +798,8 @@ class WebsocketPool:
         if self.floor is not None:
             base = self.floor
         else:
+            if self.per_minute and not os.environ.get(self.protocol.warm_env, "").strip():
+                return 0
             base = _env_int(self.protocol.warm_env, AUTO_WEBSOCKETS)
             if base == 0:
                 return 0
@@ -923,6 +941,12 @@ class WebsocketPool:
             pooled.protocol = protocol
             pooled.ready = event
             pooled.note(event)
+            if not self.per_minute and billed_per_minute(event):
+                self.per_minute = True
+                logger.info(
+                    f"Mirai: text-to-speech sockets to {self.url} are billed per connected minute, so none "
+                    f"are kept waiting; prewarm() or {self.protocol.warm_env} still keeps some"
+                )
             if self.closed or (not upgrade and len(self.ready) >= self.target()):
                 await _close_quietly(websocket)
                 return
