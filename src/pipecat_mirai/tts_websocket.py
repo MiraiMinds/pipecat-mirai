@@ -53,6 +53,7 @@ from pipecat.metrics.metrics import TTSUsageMetricsData
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import TTSService
+from pipecat.services.websocket_service import WebsocketService
 from pipecat.utils.errors import ErrorCategory
 from pipecat.utils.tracing.service_decorators import traced_tts
 
@@ -464,6 +465,11 @@ class MiraiTTSService(TTSService):
         await self.stream.cancel_turn(context_id)
         await super().on_audio_context_interrupted(context_id)
 
+
+# No longer a WebsocketTTSService (the socket is the stream's), but still a
+# websocket-streaming service to code that asks, such as Pipecat's evals: its
+# run_tts sends text and yields no audio.
+WebsocketService.register(MiraiTTSService)
 
 # The name this service had in 0.3 and 0.4; the same class.
 MiraiWebsocketTTSService = MiraiTTSService
