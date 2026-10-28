@@ -39,6 +39,9 @@ offered is not a failure: it is logged at debug level only.
 
 ``MIRAI_TTS_EDGE=off`` (``MIRAI_STT_EDGE=off``) turns the automatic edge off
 for that service in the whole process.
+
+The edge speaks Mirai's built-in voices. A workspace's own voice (``cv_...``)
+is spoken on the gateway only, so a stream in one never opens on the edge.
 """
 
 from __future__ import annotations

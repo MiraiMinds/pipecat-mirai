@@ -21,7 +21,12 @@ after a cancel arrives), ``drop_after_bytes`` (abort the first connection's TCP
 after sending that much audio), ``base64`` (send audio.chunk events instead of
 binary frames) and ``close_after`` (send session.closed and
 close the first connection that many seconds after it opens), ``refuse_status``
-(answer every handshake with that HTTP status), ``refuse_attempts``
+(answer every handshake with that HTTP status), ``refuse_voice`` (a callable
+given a session.update's voice: True answers it with a ``custom_voice_not_on_edge``
+error and keeps the voice it had, as the edge does for a custom voice),
+``unknown_voice`` (a callable given a session.update's voice: True answers
+``invalid_request`` "voice must be one of ..." and keeps the voice it had, as
+the API does for a voice the workspace doesn't have), ``refuse_attempts``
 (handshake attempts, counted from 1, answered 503), ``auth`` (a callable given
 each handshake's headers: False answers 401) and ``silent`` (never send
 session.ready). ``handshakes`` records every handshake's path and headers.
@@ -102,6 +107,8 @@ class FakeMiraiWS:
         base64=False,
         auth=None,
         silent=False,
+        refuse_voice=None,
+        unknown_voice=None,
     ):
         self.seconds = seconds
         self.reads = reads
@@ -124,6 +131,8 @@ class FakeMiraiWS:
         self.base64 = base64
         self.auth = auth
         self.silent = silent
+        self.refuse_voice = refuse_voice
+        self.unknown_voice = unknown_voice
         self.handshakes: list[dict] = []  # {"path", "headers"} of every handshake, refused or not
         self.conns: list[_Conn] = []
         self.spoken: list[tuple[int, str, str]] = []  # (conn, context, sentence) fully sent
@@ -237,6 +246,26 @@ class FakeMiraiWS:
                 conn.rate = msg["sample_rate"]
             elif "response_format" in msg:
                 conn.rate = SR
+            if "voice" in msg and self.refuse_voice is not None and self.refuse_voice(msg["voice"]):
+                await self._send(
+                    conn,
+                    {
+                        "type": "error",
+                        "code": "custom_voice_not_on_edge",
+                        "message": "custom voices are spoken on the API socket, not on the edge",
+                    },
+                )
+                return
+            if "voice" in msg and self.unknown_voice is not None and self.unknown_voice(msg["voice"]):
+                await self._send(
+                    conn,
+                    {
+                        "type": "error",
+                        "code": "invalid_request",
+                        "message": "voice must be one of ashu, neha, sameer, shruti",
+                    },
+                )
+                return
             conn.voice = msg.get("voice", conn.voice)
             await self._send(
                 conn,
