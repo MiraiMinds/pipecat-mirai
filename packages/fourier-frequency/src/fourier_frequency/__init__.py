@@ -32,16 +32,27 @@ from fourier_frequency.tts import (
     TTSListener,
     TTSStream,
     TTSTurn,
+    is_custom_voice,
+)
+from fourier_frequency.voices import (
+    CONSENT_RELATIONSHIPS,
+    CUSTOM_VOICE_LANGUAGES,
+    CustomVoice,
+    CustomVoices,
 )
 
 __version__ = "0.8.0"
 
 __all__ = [
+    "CONSENT_RELATIONSHIPS",
+    "CUSTOM_VOICE_LANGUAGES",
     "DEFAULT_BASE_URL",
     "DEFAULT_STT_WEBSOCKET_URL",
     "DEFAULT_WEBSOCKET_URL",
     "STT_LANGUAGES",
     "VOICES",
+    "CustomVoice",
+    "CustomVoices",
     "FrequencyError",
     "HttpTTS",
     "Pacer",
@@ -59,6 +70,7 @@ __all__ = [
     "Transcript",
     "__version__",
     "close_shared_connections",
+    "is_custom_voice",
     "prewarm",
     "shared_connection_stats",
     "stt_language",
