@@ -37,6 +37,7 @@ from fourier_frequency.tts import (
     HttpTTS,
     TTSListener,
     api_key_from_env,
+    is_custom_voice,
 )
 from fourier_frequency.tts import check_server_rate as _check_server_rate
 from loguru import logger
@@ -275,7 +276,7 @@ class MiraiHttpTTSService(TTSService):
         await super().start(frame)
         self._engine.sample_rate = self.sample_rate
         self._sync_settings()
-        if self._settings.voice not in VOICES:
+        if self._settings.voice not in VOICES and not is_custom_voice(self._settings.voice):
             logger.warning(f"{self}: voice {self._settings.voice!r} is not one of {', '.join(VOICES)}")
         requested = self._engine.requested_rate()
         asked = f"{requested} Hz" if requested else f"its default {SOURCE_SAMPLE_RATE} Hz"

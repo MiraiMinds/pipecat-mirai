@@ -88,6 +88,9 @@ SOURCE_SAMPLE_RATE = 48000
 SERVER_SAMPLE_RATES = (8000, 16000, 22050, 24000, 44100, 48000)
 VOICES = ("ashu", "neha", "shruti", "sameer")
 DEFAULT_VOICE = "neha"
+# The workspace's own voices (instant voices, see fourier_frequency.voices) have
+# ids that start with this. They are spoken on Mirai's API, never on the edge.
+CUSTOM_VOICE_PREFIX = "cv_"
 DEFAULT_MODEL = "mira-tts"
 # What the audio handed out is encoded as: 16-bit PCM, or G.711 for phone media streams.
 ENCODINGS = ("pcm_s16le", "mulaw", "alaw")
@@ -139,6 +142,7 @@ _ERROR_CATEGORIES = {
     "queue_full": errors.RATE_LIMIT,
     "too_many_contexts": errors.RATE_LIMIT,
     "session_closing": errors.CONNECTIVITY,
+    "custom_voice_not_on_edge": errors.INVALID_REQUEST,
 }
 _HANDSHAKE_CATEGORIES = {
     401: errors.AUTHENTICATION,
@@ -159,6 +163,8 @@ _ADVICE = {
     403: "The API key is revoked or not allowed this request.",
     429: "Ask Mirai to raise the API key's request rate limit.",
 }
+# A session.update's voice refused: the codes Mirai answers it with.
+_VOICE_REFUSALS = {"invalid_request", "voice_not_found"}
 # Where the HTTP fallback cuts streamed tokens into sentences, as Mirai does.
 _SENTENCE_END = re.compile(r"[.?!।॥…][\"')\]]*\s|\n")
 # Endpoints already reported as unavailable (the fallback is announced once per process).
@@ -171,6 +177,11 @@ def api_key_from_env(api_key: str | None, who: str) -> str:
     if not key:
         raise ValueError(f"Set MIRAI_API_KEY or pass api_key to {who}.")
     return key
+
+
+def is_custom_voice(voice: Any) -> bool:
+    """Whether ``voice`` is one of the workspace's own voices (``cv_...``), not a built-in one."""
+    return isinstance(voice, str) and voice.startswith(CUSTOM_VOICE_PREFIX)
 
 
 def check_server_rate(server_sample_rate):
@@ -811,7 +822,9 @@ class TTSStream:
     already open and authenticated and starts without a handshake. Each socket
     opens on Mirai's edge, next to the speech GPUs, when Mirai offers one
     (about half the time to first byte), and on ``url`` otherwise (see
-    :mod:`fourier_frequency.edge`).
+    :mod:`fourier_frequency.edge`). A custom voice (``cv_...``) is spoken on
+    ``url`` only: the edge serves the built-in voices, so a stream that
+    switches to a custom voice moves its socket there.
 
     Text goes to Mirai as the agent produces it: whole sentences
     (``text_mode="sentence"``, each sent with a flush so it is spoken at once)
@@ -864,7 +877,8 @@ class TTSStream:
                 Defaults to Mirai's (or to ``base_url``'s, when that is given).
             base_url: The API base URL including ``/v1`` (``https://<host>/v1``);
                 the streaming endpoint is derived from it. ``url`` wins.
-            voice: One of :data:`VOICES`.
+            voice: One of :data:`VOICES`, or one of the workspace's own voices
+                (``cv_...``, see :class:`~fourier_frequency.CustomVoices`).
             model: Mirai model name.
             sample_rate: The rate of the audio handed out (8000 for a phone call).
             server_sample_rate: The PCM rate to ask Mirai for. ``"auto"`` (the
@@ -987,6 +1001,11 @@ class TTSStream:
         self._used_ids: set[str] = set()
         self._cancelled: set[str] = set()
         self._sentence: _Sentence | None = None
+        # Moving the stream off the edge for a custom voice, when the edge said so.
+        self._mover: asyncio.Task | None = None
+        # Why Mirai refused this stream's custom voice (None: it didn't). Nothing
+        # is spoken until the voice changes: not in another voice either.
+        self._voice_refused: FrequencyError | None = None
 
         self.last_error: str | None = None
         self._connect_error: FrequencyError | None = None
@@ -1047,13 +1066,13 @@ class TTSStream:
         self._http.sample_rate = rate
         self._http.encoding = self.encoding
         self._http._closing = False
-        if self.voice not in VOICES:
+        if self.voice not in VOICES and not is_custom_voice(self.voice):
             logger.warning(f"{self}: voice {self.voice!r} is not one of {', '.join(VOICES)}")
         requested = self.requested_rate()
         asked = f"{requested} Hz" if requested else f"its default {SOURCE_SAMPLE_RATE} Hz"
         logger.debug(f"{self}: asking Mirai for {asked} PCM; output {rate} Hz")
         if self._shared_pool and self._pool is None:
-            self._pool = websocket_pool(self._url, self._headers, MAX_MESSAGE_BYTES, edge=self._edge)
+            self._pool = websocket_pool(self._url, self._headers, MAX_MESSAGE_BYTES, edge=self._edge_route())
             self._pool.hold(self)  # the first one sets the pool going
         await self._connect()
 
@@ -1061,7 +1080,7 @@ class TTSStream:
         """Close the socket, stop every turn and let go of shared connections."""
         self._disconnecting = True
         self._http._closing = True
-        for name in ("_keepalive_task", "_receive_task"):
+        for name in ("_mover", "_keepalive_task", "_receive_task"):
             task = getattr(self, name)
             setattr(self, name, None)
             if task is not None and task is not asyncio.current_task() and not task.done():
@@ -1179,12 +1198,11 @@ class TTSStream:
                 dead, self._websocket = self._websocket, None
                 await self._abandon_turns(intentional=False)
                 await _close_quietly(dead)
-            pooled = (
-                await take_websocket(self._url, self._headers, edge=self._edge) if self._shared_pool else None
-            )
+            edge = self._edge_route()
+            pooled = await take_websocket(self._url, self._headers, edge=edge) if self._shared_pool else None
             on_edge = None
-            if pooled is None and self._edge is not None:
-                on_edge = await self._edge.open(self._connect_to)
+            if pooled is None and edge is not None:
+                on_edge = await edge.open(self._connect_to)
             if pooled is not None:
                 # Already open and authenticated; nothing else has used it.
                 # The session.update below sets this call's voice and rate.
@@ -1211,6 +1229,30 @@ class TTSStream:
         for turn in list(self._turns.values()):
             if turn.held is not None and turn.retry_task is None:
                 await self._send_held(turn)
+
+    def _edge_route(self) -> EdgeRoute | None:
+        """The edge to open sockets on: none for a custom voice, which only ``url`` serves."""
+        return None if is_custom_voice(self.voice) else self._edge
+
+    def _on_edge(self) -> bool:
+        return self._is_open() and self.connected_url not in (None, self._url)
+
+    async def _move_to_api(self):
+        """Move the stream from the edge to ``url``, which speaks the custom voice.
+
+        As after a dropped socket, what the edge hadn't spoken of each reply
+        is sent again on the new socket, in the new voice.
+        """
+        logger.debug(f"{self}: voice {self.voice} is spoken on {self._url}; moving the stream there")
+        task, self._receive_task = self._receive_task, None
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            await _cancel(task)
+        websocket, self._websocket = self._websocket, None
+        await self._abandon_turns(intentional=False)
+        if websocket is not None:
+            await _close_quietly(websocket)
+            await self.listener.on_disconnected()
+        await self._connect()
 
     async def _connect_gateway(self):
         """Open ``url``, waiting out a 429 for up to ``CONNECT_RETRY_SECS``."""
@@ -1458,9 +1500,18 @@ class TTSStream:
         """Send ``text`` for ``turn_id``; its audio goes to the listener as it arrives.
 
         Raises :class:`FrequencyError` when there is no socket to send on (the
-        listener has been told why). Over the HTTP fallback, a sentence is
-        spoken before this returns.
+        listener has been told why), or when Mirai refused the stream's custom
+        voice. Over the HTTP fallback, a sentence is spoken before this returns.
         """
+        refused = self._voice_refused
+        if refused is not None:
+            raise FrequencyError(
+                refused.message,
+                category=refused.category,
+                code=refused.code,
+                request_id=refused.request_id,
+                permanent=True,
+            )
         if not self._fallback and not self._is_open():
             await self._connect()
             if not self._fallback and not self._is_open():
@@ -1533,14 +1584,22 @@ class TTSStream:
         await self._maybe_complete(turn)
 
     async def update(self, *, voice: str | None = None, model: str | None = None):
-        """Change the voice or model; it applies from the next sentence."""
+        """Change the voice or model; it applies from the next sentence.
+
+        A custom voice (``cv_...``) on a stream that is on Mirai's edge moves
+        the stream to ``url`` first; a reply in progress carries on there.
+        """
         if voice is not None:
             self.voice = voice
+            self._voice_refused = None
         if model is not None:
             self.model = model
         self._http.voice, self._http.model = self.voice, self.model
-        if self.voice not in VOICES:
+        if self.voice not in VOICES and not is_custom_voice(self.voice):
             logger.warning(f"{self}: voice {self.voice!r} is not one of {', '.join(VOICES)}")
+        if is_custom_voice(self.voice) and self._on_edge():
+            await self._move_to_api()  # its session.update sets the voice
+            return
         if self._is_open():
             try:
                 await self._send(self._session_update())
@@ -1791,8 +1850,20 @@ class TTSStream:
     async def _on_error(self, event: dict):
         code = str(event.get("code") or "error")
         message = str(event.get("message") or "")
+        if code == "custom_voice_not_on_edge" and is_custom_voice(self.voice) and self._on_edge():
+            # The edge serves built-in voices only: carry on from the API, off this receive task.
+            self._mover = asyncio.create_task(self._move_to_api(), name=f"{self}.move")
+            return
         server_id = event.get("context_id")
         request_id = event.get("request_id")
+        if (
+            not server_id
+            and code in _VOICE_REFUSALS
+            and "voice" in message.lower()
+            and is_custom_voice(self.voice)
+        ):
+            await self._refuse_voice(code, message, request_id)
+            return
         sentence = self._sentence
         if sentence is not None and request_id and sentence.request_id == request_id:
             self._sentence = None  # that sentence is over; what's buffered of it is dropped
@@ -1825,6 +1896,21 @@ class TTSStream:
         )
         # The socket stays open and Mirai goes on with the next sentence; the
         # context's flush is still answered with context.done.
+
+    async def _refuse_voice(self, code: str, message: str, request_id: str | None):
+        """Mirai doesn't know the stream's custom voice: stop every turn rather than speak in another."""
+        text = (
+            f"Mirai TTS refused voice {self.voice}: {message}. A custom voice speaks for the workspace "
+            f"that made it, until it is deleted (see CustomVoices.list())"
+        )
+        error = FrequencyError(
+            text, category=errors.INVALID_REQUEST, code=code, request_id=request_id, permanent=True
+        )
+        self._voice_refused = error
+        self.last_error = text
+        for turn in list(self._turns.values()):
+            await self._cancel_turn(turn)
+        await self.listener.on_error(error)
 
     async def _retry_later(self, turn: _Turn, delay: float, code: str, message: str):
         """Cancel what's left of ``turn`` and send it again after ``delay``.
