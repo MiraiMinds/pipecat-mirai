@@ -21,6 +21,29 @@ All notable changes to this project are documented here. The format follows
   permanent). Examples: `01-speak.py`, and `02-phone-bridge.py`, a Twilio
   Media Streams agent with barge-in. Both packages are released together;
   pipecat-mirai pins the same version.
+- **Your own voices in `fourier-frequency`.** `CustomVoices` makes an instant
+  voice from 10 to 60 seconds of one consenting speaker (`clone()`, with the
+  speaker's name, how you know them and your confirmation of their consent),
+  and lists, renames, previews and deletes the workspace's voices, over
+  `/v2/custom-voices` with the same API key. Refusals are `FrequencyError`s
+  carrying Mirai's code (`clip_rejected`, `limit_reached`, `voice_in_use`,
+  ...). The voice's id (`cv_...`) works as `voice=` on `TTSStream`,
+  `HttpTTS` and the Pipecat services.
+- **A custom voice streams from Mirai's API socket, never the edge** (which
+  serves the built-in voices): `TTSStream` skips the edge for one, takes no
+  edge socket from the warm pool, moves an open edge stream to the API socket
+  when `update(voice=...)` switches to one, and does the same if an edge
+  answers `custom_voice_not_on_edge`. If Mirai refuses a custom voice (another
+  workspace's, or deleted) the stream cancels what it sent and reports a
+  permanent `FrequencyError` instead of speaking in the session's previous
+  voice; sends raise it until `update()` names another voice. Built-in voices
+  behave exactly as before.
+- **Cookbook: `packages/fourier-frequency/cookbook/instant-voice/`.** Clone a
+  voice, stream a reply in it over the WebSocket, evaluate it against a
+  built-in voice on phone-agent lines in Hindi, English or Gujarati (time to
+  first audio p50/p95, real-time factor, characters billed, Mira STT's
+  character and word error rates against how each line should be heard, and
+  optional speaker similarity), and clean up.
 
 ### Changed
 

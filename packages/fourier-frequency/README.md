@@ -62,8 +62,9 @@ async with TTSStream(voice="shruti", sample_rate=8000, encoding="mulaw", text_mo
   the sentences, `turn.end()` speaks the rest).
 - **Barge-in**: `await turn.cancel()` cancels the reply on Mirai's side and
   stops its audio here; `await tts.interrupt()` does it for every turn.
-- **Voices**: `ashu`, `neha`, `shruti`, `sameer`. `await tts.update(voice=...)`
-  applies from the next sentence.
+- **Voices**: `ashu`, `neha`, `shruti`, `sameer`, or your own (`cv_...`, see
+  [Your own voice](#your-own-voice)). `await tts.update(voice=...)` applies
+  from the next sentence.
 - **Rates**: any `sample_rate`. Mirai is asked for it directly when it serves
   it (8, 16, 22.05, 24, 44.1 or 48 kHz); anything else is resampled here.
 - **Errors**: every error is a `FrequencyError` with a `category`
@@ -74,6 +75,37 @@ async with TTSStream(voice="shruti", sample_rate=8000, encoding="mulaw", text_mo
 
 `HttpTTS` speaks one sentence per HTTP request (`async for audio in
 tts.speak(text)`), for when you want no sockets at all.
+
+### Your own voice
+
+Make an instant voice from 10 to 60 seconds of one consenting speaker, then
+use its id as `voice=` anywhere a built-in voice goes:
+
+```python
+from fourier_frequency import CustomVoices, TTSStream
+
+async with CustomVoices() as voices:
+    voice = await voices.clone(
+        "asha.wav",
+        name="Asha",
+        language="hi",
+        consent_name="Asha Mehta",
+        consent_relationship="employee",  # self, employee, contractor, customer or other
+        consent_attested=True,  # the speaker agreed to a synthetic version of their voice
+    )
+
+async with TTSStream(voice=voice.id, sample_rate=8000, encoding="mulaw") as tts:
+    ...
+```
+
+`CustomVoices` also lists, renames, previews (WAV bytes) and deletes voices.
+A custom voice (`cv_...`) streams from Mirai's API socket rather than the
+edge; `TTSStream` does that by itself, and stops with a `FrequencyError`
+rather than speak in another voice if Mirai doesn't know the id. The
+[instant-voice cookbook](cookbook/instant-voice/README.md) goes from a
+recording to a streamed reply to an evaluation against a built-in voice:
+time to first audio, real-time factor, what Mira STT hears, and speaker
+likeness.
 
 ### Your own listener
 
