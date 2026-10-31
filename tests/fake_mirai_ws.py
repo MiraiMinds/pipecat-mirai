@@ -92,6 +92,7 @@ class FakeMiraiWS:
         always_refuse=None,
         fail=None,
         billing=None,
+        ready_billing=None,
         cancel_delay=0.0,
         drop_after_bytes=None,
         close_after=None,
@@ -112,6 +113,7 @@ class FakeMiraiWS:
         self.always_refuse = dict(always_refuse or {})
         self.fail = dict(fail or {})
         self.billing = billing or (lambda s: len(s))
+        self.ready_billing = ready_billing  # session.ready's `billing`, when set
         self.cancel_delay = cancel_delay
         self.drop_after_bytes = drop_after_bytes
         self.close_after = close_after
@@ -199,6 +201,7 @@ class FakeMiraiWS:
                 "encoding": "pcm_s16le",
                 "audio_transport": "binary",
                 "limits": {"idle_timeout_secs": 120, "max_session_secs": 3600},
+                **({"billing": self.ready_billing} if self.ready_billing else {}),
             },
         )
         speaker = asyncio.create_task(self._speaker(conn))

@@ -105,7 +105,10 @@ the whole call over it, so no sentence waits for a connection.
 - **Metrics.** Time to first byte is measured at the first audio byte of each
   reply; usage metrics are the characters Mirai billed. Pipecat tracing works.
 
-Billing is per character, as on Mirai's HTTP endpoint.
+Billing: a socket is billed per minute it is open, at ₹0.90 a minute, counted
+per second and idle seconds included, with the speech it carries included.
+Workspaces Mirai bills per character instead (as on the HTTP endpoint) are
+told so in `session.ready`, and so is the service.
 
 ### Parameters
 
@@ -144,7 +147,9 @@ Mirai sets two limits per workspace, shared by every process that uses your key
   to 3 s), which shows up as a longer time to first byte, and past that the
   service reports `at_capacity`.
 - **Open sockets.** One per live call, plus the few each process keeps waiting
-  (2, or the recent peak of calls plus 2).
+  (2, or the recent peak of calls plus 2) when your sockets are billed per
+  character. Billed per minute, none wait unless you ask (`prewarm()`,
+  `MIRAI_WARM_WEBSOCKETS`).
 
 If you plan a load test with more than 10 calls starting together, tell us the
 number and we raise your workspace's limits before you start.
@@ -234,7 +239,11 @@ Nothing else changes: the services find the connections on their own.
   so the call starts without a handshake, and the pool opens a replacement in
   the background. A socket belongs to one call and is closed when that call
   ends, never handed to another. If no socket is waiting, the service connects
-  as it always has. Waiting sockets are never billed.
+  as it always has. When your sockets are billed per minute (the default, ₹0.90
+  a minute), a waiting socket is billed like any open one, so the automatic pool
+  keeps none: each call opens its own socket, about 100 ms more on its first
+  sentence. `prewarm(websocket=M)` and `MIRAI_WARM_WEBSOCKETS` still keep M
+  waiting if that time is worth it to you.
 
 One process pays the handshakes once, at start-up, and its calls reuse them
 from then on. Several worker processes each have their own pool (connections
